@@ -69,12 +69,13 @@ def load_bhsd(
 @triton.jit
 def load_document_bounds(
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     positions,
     num_documents,
     sequence_length: tl.constexpr,
     WIDE: tl.constexpr,
 ):
-    """Find packed bounds, treating inactive capacity as one isolated document."""
+    """Find query and candidate bounds; inactive queries have no sparse candidates."""
     document = _document_ids(cu_seqlens_ptr, positions, num_documents, WIDE)
     offset = document.to(tl.int64) if WIDE else document
     # The right-sided search skips empty documents and returns N for tail/padded positions.
@@ -84,7 +85,9 @@ def load_document_bounds(
         mask=document < num_documents,
         other=sequence_length,
     )
-    return start, end
+    candidate_start = tl.load(cu_seqlens_k_ptr + offset)
+    candidate_end = tl.load(cu_seqlens_k_ptr + tl.minimum(offset + 1, num_documents))
+    return start, end, candidate_start, candidate_end
 
 
 @triton.jit

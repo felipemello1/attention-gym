@@ -31,8 +31,8 @@ def validate_packed_sequences(
 
 def packed_sequence_metadata(
     cu_seqlens: Tensor, cu_seqlens_k: Tensor, tokens: int
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Return document IDs, local query positions, and packed candidate start/end per token.
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return local query positions and packed candidate start/end per token.
 
     Right-sided search skips repeated offsets for empty documents. Capacity-tail tokens map
     to the terminal offset and an empty candidate interval, without reading beyond either
@@ -43,4 +43,4 @@ def packed_sequence_metadata(
     local_positions = positions - cu_seqlens.index_select(0, documents)
     starts = cu_seqlens_k.index_select(0, documents)
     ends = cu_seqlens_k.index_select(0, (documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1))
-    return documents, local_positions, starts, ends
+    return local_positions, starts, ends

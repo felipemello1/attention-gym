@@ -36,6 +36,7 @@ def _gather_attn_bwd_dq_shared(
     local_kv_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
@@ -101,6 +102,13 @@ def _gather_attn_bwd_dq_shared(
     delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_query = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, WIDE
+        )
+
     if TOPK:
         offsets_k = tl.arange(0, BLOCK_K)
         for selected_start in tl.range(0, TOPK, BLOCK_K, num_stages=2):
@@ -112,9 +120,11 @@ def _gather_attn_bwd_dq_shared(
                 other=-1,
             )
             selected_valid = (
-                (selected_offsets < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+                (selected_offsets < TOPK)
+                & (selected_idx >= 0)
+                & (selected_idx < candidate_end - candidate_start)
             )
-            selected_idx = tl.where(selected_valid, selected_idx, 0)
+            selected_idx = tl.where(selected_valid, selected_idx, 0) + candidate_start
             sparse_values = tl.load(
                 sparse_kv_ptr
                 + ptr_offset(
@@ -142,9 +152,6 @@ def _gather_attn_bwd_dq_shared(
                 )
                 * SCALE
             )
-
-    if HAS_CU_SEQLENS:
-        query_start, _ = load_document_bounds(cu_seqlens_ptr, sequence, num_documents, S, WIDE)
 
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
@@ -215,7 +222,7 @@ def _gather_attn_bwd_dq_shared(
             (32, 64, 8),
         )
     ],
-    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK"],
+    key=["B", "H", "S", "D", "SPARSE_SEQ_LEN", "TOPK", "HAS_CU_SEQLENS"],
     reset_to_zero=["grad_sparse_kv_ptr"],
     prune_configs_by={"early_config_prune": prune_wide_backward_configs},
     cache_results=True,
@@ -225,6 +232,8 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
     sparse_kv_ptr,
     kv_indices_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     output_ptr,
     grad_output_ptr,
     lse_ptr,
@@ -232,6 +241,7 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     QUERY_STRIDES: tl.constexpr,
     SPARSE_KV_STRIDES: tl.constexpr,
     KV_INDICES_STRIDES: tl.constexpr,
+    num_documents,
     LSE_STRIDES: tl.constexpr,
     GRAD_SPARSE_KV_STRIDES: tl.constexpr,
     B: tl.constexpr,
@@ -241,6 +251,8 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     SPARSE_SEQ_LEN: tl.constexpr,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    WIDE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -265,8 +277,18 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
         mask=selected_mask,
         other=-1,
     )
-    selected_valid = selected_mask & (selected_indices >= 0) & (selected_indices < SPARSE_SEQ_LEN)
-    selected_indices = tl.where(selected_valid, selected_indices, 0)
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        _, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
+        )
+    selected_valid = (
+        selected_mask
+        & (selected_indices >= 0)
+        & (selected_indices < candidate_end - candidate_start)
+    )
+    selected_indices = tl.where(selected_valid, selected_indices, 0) + candidate_start
 
     head_dimension_mask = head_mask[:, None] & dimension_mask[None, :]
     query_offsets = ptr_offset(

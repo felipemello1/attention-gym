@@ -204,7 +204,7 @@ def lightning_indexer(
 
             candidate_bounds = None
             if cu_seqlens is not None:
-                _, positions, starts, ends = packed_sequence_metadata(
+                positions, starts, ends = packed_sequence_metadata(
                     cu_seqlens, cu_seqlens_k, q.shape[1]
                 )
                 if causal:

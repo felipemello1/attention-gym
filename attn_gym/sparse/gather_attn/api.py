@@ -6,10 +6,7 @@ from typing import overload
 import torch
 from torch import Tensor
 
-from attn_gym.sparse._varlen import (
-    packed_sequence_metadata,
-    validate_packed_sequences,
-)
+from attn_gym.sparse._varlen import validate_packed_sequences
 from attn_gym.types import Impl, resolve_impl
 
 
@@ -314,15 +311,6 @@ def gather_attn(
         share_kv,
     )
     validate_packed_sequences(cu_seqlens, cu_seqlens_k, batch=query.shape[0], device=query.device)
-    if cu_seqlens is not None:
-        _, _, starts, ends = packed_sequence_metadata(cu_seqlens, cu_seqlens_k, query.shape[2])
-        valid = (kv_indices >= 0) & (kv_indices < (ends - starts)[None, :, None])
-        # Validity is computed in local coordinates, before translating the pool address.
-        kv_indices = torch.where(valid, kv_indices, 0) + starts[None, :, None]
-    else:
-        valid = (kv_indices >= 0) & (kv_indices < sparse_kv.shape[2])
-    kv_indices = torch.where(valid, kv_indices, -1)
-
     if scale is not None and not scale > 0:
         raise ValueError("scale must be greater than 0.")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
@@ -356,6 +344,7 @@ def gather_attn(
         kv_indices,
         attention_sink,
         cu_seqlens,
+        cu_seqlens_k,
         sliding_window_size,
         share_kv,
         scale=scale,

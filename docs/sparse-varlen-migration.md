@@ -30,11 +30,19 @@ Without offsets, ordinary batched behavior is unchanged. With offsets:
   token gradients beyond the query endpoint are undefined; fixed-capacity
   callers must mask those rows, as with KDA.
 
-The fused gather paths do not allocate per-token document labels. Triton reads
-`cu_seqlens` directly to bound local attention in forward and backward. The
-CuTe/FA4 adapter uses those same offsets when building FA4's existing gather-index
-tensor; FA4 itself is unchanged. Do not modify query offsets between forward and
-backward, since they define the attention operation whose gradients are computed.
+The fused gather paths consume local indices and offsets directly: there is no
+standalone normalization pass, expanded document-label tensor, or normalized-index
+tensor saved for backward. Triton uses `cu_seqlens` for local-window bounds and
+`cu_seqlens_k` when addressing selected sparse keys. Its backward reverse-map
+builder forms global sort keys only as temporary workspace. The CuTe/FA4 adapter
+translates directly into FA4's existing gather-index tensor; FA4 itself is unchanged.
+Do not modify either offset tensor between forward and backward, since they define
+the attention operation whose gradients are computed.
+
+Triton's compiled path specializes physical attention/index tensor shapes and
+layouts; packed lengths can change through offset contents between calls. For
+outer-strided KV views whose strides vary independently of their shapes, compile
+with `dynamic=False` so those layouts are specialized too.
 
 ## Compression boundaries
 

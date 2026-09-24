@@ -24,6 +24,7 @@ def _gather_attn_fwd(
     local_kv_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     attention_sink_ptr,
     output_ptr,
     lse_ptr,
@@ -68,8 +69,12 @@ def _gather_attn_fwd(
         query_mask[:, None] & dimension_mask[None, :],
     )
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
-        query_start, _ = load_document_bounds(cu_seqlens_ptr, offsets_m, num_documents, S, WIDE)
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+        )
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
@@ -86,7 +91,9 @@ def _gather_attn_fwd(
             mask=query_mask,
             other=0,
         )
-        valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+        valid = query_mask & (selected_idx >= 0) & (selected_idx < candidate_end - candidate_start)
+        # Mask local coordinates before adding the document base, including int64 sentinels.
+        selected_idx = tl.where(valid, selected_idx, 0) + candidate_start
         sparse_value = load_bhsd(
             sparse_kv_ptr,
             SPARSE_KV_STRIDES,
@@ -175,6 +182,7 @@ def _gather_attn_fwd_shared(
     local_kv_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     attention_sink_ptr,
     output_ptr,
     lse_ptr,
@@ -223,6 +231,13 @@ def _gather_attn_fwd_shared(
     running_sum = tl.full((BLOCK_H,), 1.0, tl.float32)
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, WIDE
+        )
+
     if TOPK:
         # Keep on-chip storage bounded when the selected set contains hundreds of entries.
         offsets_k = tl.arange(0, BLOCK_K)
@@ -235,9 +250,11 @@ def _gather_attn_fwd_shared(
                 other=-1,
             )
             selected_valid = (
-                (selected_offsets < TOPK) & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+                (selected_offsets < TOPK)
+                & (selected_idx >= 0)
+                & (selected_idx < candidate_end - candidate_start)
             )
-            selected_idx = tl.where(selected_valid, selected_idx, 0)
+            selected_idx = tl.where(selected_valid, selected_idx, 0) + candidate_start
             sparse_values = tl.load(
                 sparse_kv_ptr
                 + ptr_offset(
@@ -252,9 +269,6 @@ def _gather_attn_fwd_shared(
             accumulator, running_max, running_sum = online_softmax_update(
                 accumulator, running_max, running_sum, logits, sparse_values
             )
-
-    if HAS_CU_SEQLENS:
-        query_start, _ = load_document_bounds(cu_seqlens_ptr, sequence, num_documents, S, WIDE)
 
     offsets_n_base = tl.arange(0, BLOCK_N)
     first_local_position = sequence - WINDOW + 1
@@ -311,6 +325,7 @@ def _gather_attn_fwd_tma(
     local_desc,
     kv_indices_ptr,
     cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
     attention_sink_ptr,
     output_desc,
     lse_ptr,
@@ -347,8 +362,12 @@ def _gather_attn_fwd_tma(
         (BLOCK_M, BLOCK_D),
     )
 
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
-        query_start, _ = load_document_bounds(cu_seqlens_ptr, offsets_m, num_documents, S, WIDE)
+        query_start, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+        )
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
@@ -364,7 +383,9 @@ def _gather_attn_fwd_tma(
             mask=query_mask,
             other=0,
         )
-        valid = query_mask & (selected_idx >= 0) & (selected_idx < SPARSE_SEQ_LEN)
+        valid = query_mask & (selected_idx >= 0) & (selected_idx < candidate_end - candidate_start)
+        # Mask local coordinates before adding the document base, including int64 sentinels.
+        selected_idx = tl.where(valid, selected_idx, 0) + candidate_start
         sparse_value = load_bhsd(
             sparse_kv_ptr,
             SPARSE_KV_STRIDES,
@@ -425,6 +446,7 @@ def _launch_forward(
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -437,7 +459,7 @@ def _launch_forward(
     lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
-    wide = requires_int64_offsets(cu_seqlens)
+    wide = requires_int64_offsets(cu_seqlens, cu_seqlens_k)
 
     # This head-major schedule is tuned for shared KV on Blackwell.
     if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
@@ -454,6 +476,7 @@ def _launch_forward(
             local_kv,
             kv_indices,
             cu_seqlens,
+            cu_seqlens_k,
             attention_sink,
             output,
             lse,
@@ -497,6 +520,7 @@ def _launch_forward(
             local_desc,
             kv_indices,
             cu_seqlens,
+            cu_seqlens_k,
             attention_sink,
             output_desc,
             lse,
@@ -525,6 +549,7 @@ def _launch_forward(
             local_kv,
             kv_indices,
             cu_seqlens,
+            cu_seqlens_k,
             attention_sink,
             output,
             lse,
