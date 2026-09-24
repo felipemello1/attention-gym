@@ -30,6 +30,12 @@ Without offsets, ordinary batched behavior is unchanged. With offsets:
   token gradients beyond the query endpoint are undefined; fixed-capacity
   callers must mask those rows, as with KDA.
 
+The fused gather paths do not allocate per-token document labels. Triton reads
+`cu_seqlens` directly to bound local attention in forward and backward. The
+CuTe/FA4 adapter uses those same offsets when building FA4's existing gather-index
+tensor; FA4 itself is unchanged. Do not modify query offsets between forward and
+backward, since they define the attention operation whose gradients are computed.
+
 ## Compression boundaries
 
 The indexer processes whole documents starting at position zero. At compression

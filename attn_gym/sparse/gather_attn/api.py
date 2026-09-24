@@ -314,12 +314,8 @@ def gather_attn(
         share_kv,
     )
     validate_packed_sequences(cu_seqlens, cu_seqlens_k, batch=query.shape[0], device=query.device)
-    doc_ids = None
     if cu_seqlens is not None:
-        documents, _, starts, ends = packed_sequence_metadata(
-            cu_seqlens, cu_seqlens_k, query.shape[2]
-        )
-        doc_ids = documents.unsqueeze(0)
+        _, _, starts, ends = packed_sequence_metadata(cu_seqlens, cu_seqlens_k, query.shape[2])
         valid = (kv_indices >= 0) & (kv_indices < (ends - starts)[None, :, None])
         # Validity is computed in local coordinates, before translating the pool address.
         kv_indices = torch.where(valid, kv_indices, 0) + starts[None, :, None]
@@ -359,7 +355,7 @@ def gather_attn(
         sparse_kv,
         kv_indices,
         attention_sink,
-        doc_ids,
+        cu_seqlens,
         sliding_window_size,
         share_kv,
         scale=scale,
