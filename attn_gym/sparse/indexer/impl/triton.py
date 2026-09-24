@@ -26,6 +26,7 @@ def _index_kernel(
     K,
     W,
     Out,
+    CandidateBounds,
     T: tl.constexpr,
     S: tl.constexpr,
     H: tl.constexpr,
@@ -41,6 +42,7 @@ def _index_kernel(
     BN: tl.constexpr,
     KEEP: tl.constexpr,
     WIDE: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     """Stream TMA key tiles through tensor cores and a register-resident Top-K."""
     batch = tl.program_id(1)
@@ -58,8 +60,12 @@ def _index_kernel(
     q = Q.load([batch.to(tl.int32), query.to(tl.int32), 0, 0]).reshape(BH, BD)
     best = tl.full((KEEP,), -9223372036854775808, tl.int64)
     rank = tl.arange(0, KEEP)
+    begin = 0
     end = (query + 1) // RATIO if CAUSAL else S
-    for start in tl.range(0, end, BN):
+    if PACKED:
+        begin = tl.load(CandidateBounds + query * 2)
+        end = tl.load(CandidateBounds + query * 2 + 1)
+    for start in tl.range(begin, end, BN):
         k = K.load([batch.to(tl.int32), start.to(tl.int32), 0]).reshape(BN, BD)
         dots = tl.dot(k, tl.trans(q))
         scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], axis=1)
@@ -72,17 +78,23 @@ def _index_kernel(
         packed = tl.where((rank < BN) & (candidate < end), packed, -9223372036854775808)
         best = tl.topk(tl.join(best, packed).reshape(2 * KEEP), KEEP)
     indices = (0xFFFFFFFF - (best & 0xFFFFFFFF)).to(tl.int32)
-    indices = tl.where(best == -9223372036854775808, -1, indices)
+    indices = tl.where(best == -9223372036854775808, -1, indices - begin)
     tl.store(Out + ptr_offset((batch, query, rank), (T * TOPK, TOPK, 1)), indices, rank < TOPK)
 
 
 def launch(
-    q: Tensor, k: Tensor, weights: Tensor, topk: int, causal: bool, compress_ratio: int
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk: int,
+    causal: bool,
+    compress_ratio: int,
+    candidate_bounds: Tensor | None = None,
 ) -> Tensor:
     """Return nondifferentiable INT32 indices without a quadratic workspace.
 
     Q/K require contiguous last dimensions and 16-byte-aligned bases/outer
-    strides. FP16/BF16, H/D <= 256, T <= 2**20, and any Top-K <= S are supported; the
+    strides. FP16/BF16, H/D <= 256, T <= 2**20, and non-negative Top-K are supported; the
     register-resident selection makes each key tile cost grow with Top-K.
     Gradient-requiring inputs are allowed: selection returns indices, not trainable scores.
     The public registered operator keeps host descriptors outside graph tracing.
@@ -99,11 +111,13 @@ def launch(
         )
     if compress_ratio < 1:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}.")
-    if candidates != tokens // compress_ratio:
+    if candidate_bounds is None and candidates != tokens // compress_ratio:
         raise ValueError(
             f"k must hold T // compress_ratio candidates, got T={tokens}, S={candidates}, "
             f"compress_ratio={compress_ratio}."
         )
+    if candidates == 0:
+        return torch.full((batch, tokens, topk), -1, dtype=torch.int32, device=q.device)
     for tensor in (q, k):
         if tensor.stride(-1) != 1 or any(s % 8 for s in tensor.stride()[:-1]):
             raise ValueError("TMA requires a contiguous last dimension and 16-byte outer strides.")
@@ -127,6 +141,7 @@ def launch(
             k_desc,
             weights,
             output,
+            candidate_bounds,
             tokens,
             candidates,
             heads,
@@ -139,7 +154,8 @@ def launch(
             bd,
             bn,
             keep,
-            requires_int64_offsets(q, k, weights, output),
+            requires_int64_offsets(q, k, weights, output, candidate_bounds),
+            candidate_bounds is not None,
             num_warps=8,
             num_stages=1,
         )

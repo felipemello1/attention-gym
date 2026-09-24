@@ -66,6 +66,7 @@ nav:
   - Guides:
       - guides/index.md
       - Ragged CUDA Graphs: guides/ragged-cuda-graphs.md
+      - Packed Sparse Attention: sparse-varlen-migration.md
       - Determinism: determinism.md
   - Reference:
       - Masks: masks.md

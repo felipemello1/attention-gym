@@ -36,7 +36,7 @@ _SCORE_WORKSPACE_BYTES = 32 * 1024 * 1024
 
 
 def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
-    """Size a slab for positive B and the validated CuTe domain 1 <= S <= T <= 2**20."""
+    """Size a slab for positive B/T/S; return zero if a query pair cannot fit the budget."""
     return min(
         _MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * candidates)
     )
@@ -111,7 +111,12 @@ def _compile_scores(
 
 @jit_cache
 def _compile_topk(
-    topk: int, causal: bool, compress_ratio: int, use_int64_offsets: bool, deterministic: bool
+    topk: int,
+    causal: bool,
+    compress_ratio: int,
+    use_int64_offsets: bool,
+    deterministic: bool,
+    has_candidate_bounds: bool = False,
 ) -> Callable[..., None]:
     """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
     import cutlass
@@ -136,22 +141,39 @@ def _compile_topk(
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
     )
-    return compile_tvm_ffi(
-        IndexerTopKKernel(
-            topk,
-            causal,
-            use_int64_offsets,
-            compress_ratio=compress_ratio,
-            deterministic=deterministic,
-        ),
-        scores,
-        output,
-        integer(0),
+    operation = IndexerTopKKernel(
+        topk,
+        causal,
+        use_int64_offsets,
+        compress_ratio=compress_ratio,
+        deterministic=deterministic,
     )
+    if has_candidate_bounds:
+        candidate_bounds = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (tokens, 2),
+            stride_order=(1, 0),
+            assumed_align=4,
+            use_32bit_stride=not use_int64_offsets,
+        )
+        return compile_tvm_ffi(
+            operation.with_candidate_bounds,
+            scores,
+            output,
+            integer(0),
+            candidate_bounds,
+            name=f"{operation.get_name()}_packed",
+        )
+    return compile_tvm_ffi(operation, scores, output, integer(0))
 
 
 def _validate(
-    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int, compress_ratio: int
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    topk: int,
+    compress_ratio: int,
+    candidate_bounds: torch.Tensor | None = None,
 ) -> None:
     """Validate SM100/SM103 indexer tensor metadata and base alignment."""
     if q.ndim != 4:
@@ -164,7 +186,7 @@ def _validate(
     batch, queries, heads, head_dim = q.shape
     if compress_ratio < 1:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    candidates = queries // compress_ratio
+    candidates = k.shape[1] if candidate_bounds is not None else queries // compress_ratio
     if tuple(k.shape) != (batch, candidates, head_dim):
         raise ValueError(
             f"k must have shape {(batch, candidates, head_dim)} for T={queries} and "
@@ -187,9 +209,8 @@ def _validate(
         )
     if not isinstance(topk, int) or isinstance(topk, bool):
         raise TypeError(f"topk must be an int, got {type(topk).__name__}")
-    if topk < 0 or topk > candidates:
-        raise ValueError(f"topk must be in [0, {candidates}], got {topk}")
-
+    if topk < 0:
+        raise ValueError(f"topk must be non-negative, got {topk}")
     tensors = (q, k, weights)
     if any(not tensor.is_cuda for tensor in tensors):
         raise ValueError("q, k, and weights must all be CUDA tensors")
@@ -202,7 +223,7 @@ def _validate(
             f"q, k, and weights must have one dtype, got {q.dtype}, {k.dtype}, {weights.dtype}"
         )
     # Singleton strides do not address another slice; TVM-FFI normalizes them for TMA.
-    if any(not tensor_supports_tma(tensor.squeeze()) for tensor in (q, k)):
+    if any(tensor.numel() and not tensor_supports_tma(tensor.squeeze()) for tensor in (q, k)):
         raise ValueError(
             f"q and k require unit last strides and {TMA_ALIGNMENT_BYTES}-byte aligned "
             "bases and non-singleton outer strides"
@@ -220,24 +241,32 @@ def launch(
     causal: bool = False,
     compress_ratio: int = 1,
     deterministic: bool = False,
+    candidate_bounds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage.
 
     ``deterministic`` returns ascending indices with exact ties resolved to the
     lowest indices; otherwise order and tie choice depend on thread timing.
+    Packed ``candidate_bounds[T, 2]`` gives each query's valid global interval;
+    returned indices are relative to its start. Bounds must describe complete
+    documents with per-document floor compression, not arbitrary cached queries.
     """
     import cutlass
 
-    _validate(q, k, weights, topk, compress_ratio)
+    _validate(q, k, weights, topk, compress_ratio, candidate_bounds)
     batch, tokens, heads, head_dim = q.shape
     candidates = k.shape[1]
     output = torch.empty((batch, tokens, topk), dtype=torch.int32, device=q.device)
     if topk == 0:
         return output
+    if candidates == 0:
+        return output.fill_(-1)
 
     pairs = score_workspace_pairs(batch, tokens, candidates)
+    if pairs == 0:
+        raise ValueError("CuTe candidate capacity is too large for the 32 MiB score workspace")
     scores = torch.empty((pairs, 2, candidates), dtype=torch.float32, device=q.device)
-    use_int64_offsets = requires_int64_abi(q, k, weights, scores, output)
+    use_int64_offsets = requires_int64_abi(q, k, weights, scores, output, candidate_bounds)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     previous = get_compile_target()
     try:
@@ -252,7 +281,12 @@ def launch(
             use_int64_offsets,
             weights.stride(-1) == 1,
         )
-        topk_kernel = _compile_topk(topk, causal, compress_ratio, use_int64_offsets, deterministic)
+        topk_args = (topk, causal, compress_ratio, use_int64_offsets, deterministic)
+        topk_kernel = (
+            _compile_topk(*topk_args, has_candidate_bounds=True)
+            if candidate_bounds is not None
+            else _compile_topk(*topk_args)
+        )
     finally:
         set_compile_target(previous)
 
@@ -262,8 +296,14 @@ def launch(
     with initialized_cuda_device(q):
         for start in range(0, total_pairs, pairs):
             active_scores = scores[: min(pairs, total_pairs - start)]
+            # For full documents, sum(floor(length / ratio)) before this document
+            # plus its local causal count never exceeds the global causal prefix.
+            # The unchanged score kernels therefore write every entry Top-K reads.
             score_kernel(q, k, weights, active_scores, integer(start), scale)
-            topk_kernel(active_scores, output, integer(start))
+            if candidate_bounds is None:
+                topk_kernel(active_scores, output, integer(start))
+            else:
+                topk_kernel(active_scores, output, integer(start), candidate_bounds)
     return output
 
 
