@@ -34,8 +34,15 @@ The fused gather paths consume local indices and offsets directly: there is no
 standalone normalization pass, expanded document-label tensor, or normalized-index
 tensor saved for backward. Triton uses `cu_seqlens` for local-window bounds and
 `cu_seqlens_k` when addressing selected sparse keys. Its backward reverse-map
-builder forms global sort keys only as temporary workspace. The CuTe/FA4 adapter
-translates directly into FA4's existing gather-index tensor; FA4 itself is unchanged.
+builder forms global sort keys only as temporary workspace.
+
+Packed CuTe/FA4 calls use `flash_attn_varlen_func`. The adapter interleaves KV as
+`[local_0, sparse_0, local_1, sparse_1, ...]` and passes document-relative gather
+indices; FA4 applies each document's base offset inside its kernels. This replaces
+the dense adapter's flat concatenation, and backward applies the inverse permutation.
+An isolated final document holds unused capacity, so CUDA Graph replay can change
+active lengths without reading endpoints on the CPU. FA4 itself is unchanged.
+
 Do not modify either offset tensor between forward and backward, since they define
 the attention operation whose gradients are computed.
 
