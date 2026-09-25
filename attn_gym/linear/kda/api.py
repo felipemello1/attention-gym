@@ -21,6 +21,7 @@ from typing import Literal
 import torch
 
 from attn_gym.linear._delta_rule.validation import (
+    SUPPORTED_ACTIVATION_DTYPES,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -506,8 +507,10 @@ def recurrent_kda_decode(
             within each section, head rows are contiguous.
         raw_gate: Unactivated gate shaped ``[1, B, H, K]``.
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
-        A_log: FP32 per-head log decay parameter shaped ``[H]``.
-        dt_bias: FP32 per-head/channel gate bias shaped ``[H, K]``.
+        A_log: Per-head log decay parameter shaped ``[H]``. FP32, BF16, or FP16; the kernel
+            reads it in FP32, so a BF16 model parameter needs no per-call cast.
+        dt_bias: Per-head/channel gate bias shaped ``[H, K]``, with the same dtype rules as
+            ``A_log``.
         state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
             Slots may have padding between them but each ``[H, V, K]`` row must be dense.
             Recurrence math remains FP32 and the updated state is cast to the pool dtype.
@@ -565,10 +568,12 @@ def recurrent_kda_decode(
         raise ValueError(f"raw_beta must have shape {(1, batch, heads)} with contiguous heads")
     if (
         dt_bias.shape != (heads, key_dim)
-        or dt_bias.dtype != torch.float32
+        or dt_bias.dtype not in SUPPORTED_ACTIVATION_DTYPES
         or not dt_bias.is_contiguous()
     ):
-        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads}, {key_dim})")
+        raise ValueError(
+            f"dt_bias must be contiguous with shape ({heads}, {key_dim}) and a floating dtype"
+        )
 
     use_lower_bound = _resolve_decode_gate_transform(gate_transform)
     if use_lower_bound:

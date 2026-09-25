@@ -119,8 +119,12 @@ def validate_decode_inputs(
         raise ValueError(
             f"state_cache must have nonempty dimensions, got {tuple(state_cache.shape)}"
         )
-    if A_log.shape != (heads,) or A_log.dtype != torch.float32 or not A_log.is_contiguous():
-        raise ValueError(f"A_log must be contiguous float32 with shape ({heads},)")
+    if (
+        A_log.shape != (heads,)
+        or A_log.dtype not in SUPPORTED_ACTIVATION_DTYPES
+        or not A_log.is_contiguous()
+    ):
+        raise ValueError(f"A_log must be contiguous with shape ({heads},) and a floating dtype")
     if state_cache.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError("state_cache must use float32 or bfloat16")
     if state_cache.stride()[1:] != (value_dim * key_dim, key_dim, 1):
