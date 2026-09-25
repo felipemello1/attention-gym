@@ -289,6 +289,27 @@ def test_recurrent_decode_fresh_slots_start_from_zero():
     torch.testing.assert_close(state_cache, expected_cache, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
+def test_recurrent_decode_reads_low_precision_gate_parameters_in_fp32(param_dtype: torch.dtype):
+    """BF16/FP16 A_log and dt_bias match passing the same values already upcast to FP32."""
+    packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = (
+        _decode_inputs()
+    )
+    A_log, dt_bias = A_log.to(param_dtype), dt_bias.to(param_dtype)
+    outputs, caches = [], []
+    for gate_params in ((A_log, dt_bias), (A_log.float(), dt_bias.float())):
+        cache = state_cache.clone()
+        outputs.append(
+            recurrent_kda_decode(
+                packed_qkv, raw_gate, raw_beta, *gate_params, cache, state_indices
+            )
+        )
+        caches.append(cache)
+
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    torch.testing.assert_close(caches[0], caches[1], rtol=0, atol=0)
+
+
 def test_recurrent_decode_softplus_matches_negative_tail_reference():
     inputs = _decode_inputs(batch=1, heads=1, key_dim=16, value_dim=8, dtype=torch.float32)
     packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
@@ -409,10 +430,10 @@ def test_recurrent_decode_validates_contract():
             lower_bound=1.0,
         )
     for name, invalid_A_log, invalid_dt_bias in (
-        ("A_log", A_log.bfloat16(), dt_bias),
-        ("dt_bias", A_log, dt_bias.bfloat16()),
+        ("A_log", A_log.int(), dt_bias),
+        ("dt_bias", A_log, dt_bias.int()),
     ):
-        with pytest.raises(ValueError, match=rf"{name} must be contiguous float32"):
+        with pytest.raises(ValueError, match=rf"{name} must be contiguous with shape"):
             recurrent_kda_decode(
                 packed_qkv,
                 raw_gate,
