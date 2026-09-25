@@ -228,6 +228,30 @@ def test_decode_padding_and_fresh_slots():
     )
 
 
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
+def test_decode_reads_low_precision_gate_parameters_in_fp32(param_dtype: torch.dtype):
+    """BF16/FP16 A_log and dt_bias match passing the same values already upcast to FP32."""
+    inputs = make_decode_inputs(dtype=torch.bfloat16)
+    A_log, dt_bias = inputs["A_log"].to(param_dtype), inputs["dt_bias"].to(param_dtype)
+    outputs, pools = [], []
+    for gate_params in ((A_log, dt_bias), (A_log.float(), dt_bias.float())):
+        pool = inputs["state_cache"].clone()
+        outputs.append(
+            recurrent_gdn_decode(
+                inputs["packed_qkv"],
+                inputs["raw_gate"],
+                inputs["raw_beta"],
+                *gate_params,
+                pool,
+                inputs["state_indices"],
+            )
+        )
+        pools.append(pool)
+
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    torch.testing.assert_close(pools[0], pools[1], rtol=0, atol=0)
+
+
 def test_decode_out_buffer_contract():
     inputs = make_decode_inputs()
     heads, value_dim = inputs["state_cache"].shape[1:3]

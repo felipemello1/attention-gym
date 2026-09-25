@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from attn_gym.linear._delta_rule.validation import (
+    SUPPORTED_ACTIVATION_DTYPES,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -319,8 +320,9 @@ def recurrent_gdn_decode(
         raw_gate: Unactivated per-head gate projection shaped ``[1, B, H]``, matching the
             vLLM-style single-token decode convention used by ``recurrent_kda_decode``.
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
-        A_log: FP32 per-head log decay parameter shaped ``[H]``.
-        dt_bias: FP32 per-head gate bias shaped ``[H]``.
+        A_log: Per-head log decay parameter shaped ``[H]``. FP32, BF16, or FP16; the kernel
+            reads it in FP32, so a BF16 model parameter needs no per-call cast.
+        dt_bias: Per-head gate bias shaped ``[H]``, with the same dtype rules as ``A_log``.
         state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
             Slots may have padding between them but each ``[H, V, K]`` row must be dense.
             Recurrence math remains FP32 and the updated state is cast to the pool dtype.
@@ -369,8 +371,12 @@ def recurrent_gdn_decode(
     for name, tensor in (("raw_gate", raw_gate), ("raw_beta", raw_beta)):
         if tensor.shape != (1, batch, heads) or tensor.stride(2) != 1:
             raise ValueError(f"{name} must have shape {(1, batch, heads)} with contiguous heads")
-    if dt_bias.shape != (heads,) or dt_bias.dtype != torch.float32 or not dt_bias.is_contiguous():
-        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads},)")
+    if (
+        dt_bias.shape != (heads,)
+        or dt_bias.dtype not in SUPPORTED_ACTIVATION_DTYPES
+        or not dt_bias.is_contiguous()
+    ):
+        raise ValueError(f"dt_bias must be contiguous with shape ({heads},) and a floating dtype")
 
     scale = resolve_scale(scale, key_dim)
 

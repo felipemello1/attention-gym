@@ -37,7 +37,7 @@ from attn_gym._backends.cute import (
 from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import make_fake_strided_tensor, requires_int64_abi
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.utils import ceildiv
@@ -2987,8 +2987,16 @@ def _validate_decode_inputs(
         raise ValueError(
             f"x must have positive sequence and channel dimensions, got {tuple(x.shape)}"
         )
-    if x.dtype not in SHORT_CONV_DTYPES or not x.is_cuda or not x.is_contiguous():
-        raise ValueError("x must be a contiguous CUDA FP16, BF16, or FP32 tensor")
+    if (
+        x.dtype not in SHORT_CONV_DTYPES
+        or not x.is_cuda
+        or x.stride(1) != 1
+        or x.stride(0) < x.shape[1]
+    ):
+        raise ValueError(
+            "x must be a CUDA FP16, BF16, or FP32 tensor with contiguous channels "
+            "and non-overlapping rows"
+        )
     if weight.ndim != 2 or weight.shape[0] != x.shape[1] or weight.shape[1] < 2:
         raise ValueError(
             f"weight must have shape [{x.shape[1]}, W] with W >= 2, got {tuple(weight.shape)}"
@@ -3606,7 +3614,14 @@ def _compile_decode(
     )
     return compile_tvm_ffi(
         operation,
-        _fake_dynamic_rows(dtype, channels),
+        # Rows may be strided (a column slice of a fused projection); each row's
+        # channel groups stay vector-aligned.
+        make_fake_strided_tensor(
+            dtype.cute_type,
+            (cute.sym_int32(), channels),
+            stride_divisibility=config.channels_per_thread,
+            use_int64_strides=False,
+        ),
         _fake_matrix(dtype, channels, width),
         _fake_dynamic_rows(dtype, channels),
         _fake_decode_state(dtype, width, channels),
@@ -3627,6 +3642,8 @@ def _launch_decode(
 ) -> torch.Tensor:
     """Allocate the output and launch the compiled decode specialization."""
     resolved_activation = resolve_activation(activation)
+    if x.stride(0) % config.channels_per_thread:
+        x = x.contiguous()
     x, weight = _aligned(x), _aligned(weight)
     if state.data_ptr() % 16 != 0:
         raise ValueError("state storage must be 16-byte aligned for the in-place advance")
@@ -3634,7 +3651,7 @@ def _launch_decode(
     width = weight.shape[1]
     _validate_config(config, channels, "forward_config")
     dtype = SHORT_CONV_DTYPES[x.dtype]
-    output = torch.empty_like(x)
+    output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     compiled = _compile_decode(
         channels,
         width,
@@ -3830,7 +3847,7 @@ def _decode_fake(
     has_initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del weight, state, state_indices, activation, has_initial_state
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_configured_decode_cuda(
@@ -3888,7 +3905,7 @@ def _configured_decode_fake(
         activation,
         has_initial_state,
     )
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 def _cute_short_conv_bwd_cuda(
