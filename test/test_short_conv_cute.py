@@ -2026,6 +2026,26 @@ def test_short_conv_decode_accepts_misaligned_contiguous_storage():
     _assert_conv_matches(_decode_conv, x, weight)
 
 
+@pytest.mark.parametrize("row_padding", [8, 13])
+def test_short_conv_decode_accepts_row_strided_input(paged_short_conv_inputs, row_padding: int):
+    """A column slice of a wider row-major buffer decodes like its contiguous copy.
+
+    A padding of 8 keeps every row vector-aligned; 13 exercises the copy fallback.
+    """
+    x, weight, state, slots = paged_short_conv_inputs(channels=64)
+    wide = torch.randn(x.shape[0], x.shape[1] + row_padding, device="cuda", dtype=x.dtype)
+    wide[:, : x.shape[1]] = x
+    strided = wide[:, : x.shape[1]]
+    assert not strided.is_contiguous()
+    expected_state = state.clone()
+    expected = causal_conv1d_decode(x, weight, expected_state, state_indices=slots)
+
+    actual = causal_conv1d_decode(strided, weight, state, state_indices=slots)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
 def test_short_conv_decode_registered_custom_activation():
     """Fuse a user-registered CuTeDSL activation into the one-token step."""
     activations.register_activation("tanh", _tanh_activation, _tanh_activation_derivative)
@@ -2737,8 +2757,12 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
         causal_conv1d_decode(x[:0], weight, state, state_indices=slots[:0])
     with pytest.raises(ValueError, match="weight must have shape"):
         causal_conv1d_decode(x, weight[:-1], state, state_indices=slots)
-    with pytest.raises(ValueError, match="contiguous CUDA FP16, BF16, or FP32"):
+    with pytest.raises(
+        ValueError, match="CUDA FP16, BF16, or FP32 tensor with contiguous channels"
+    ):
         causal_conv1d_decode(x.double(), weight, state, state_indices=slots)
+    with pytest.raises(ValueError, match="contiguous channels"):
+        causal_conv1d_decode(x.t().contiguous().t(), weight, state, state_indices=slots)
     with pytest.raises(ValueError, match="weight must match x dtype"):
         causal_conv1d_decode(x, weight.cpu(), state, state_indices=slots)
     with pytest.raises(ValueError, match="state must match x dtype"):
