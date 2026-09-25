@@ -17,6 +17,7 @@ from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
+from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_head_sum import sum_expanded_head_gradients
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
     chunk_gdn_bwd_intra_packed,
@@ -539,17 +540,11 @@ def _finish_chunk_gdn_bwd(
     )
     intra_dq, intra_dk, intra_db, d_gate = intra
     del d_aqk, d_raw_akk, dg_raw
-    # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk`` (allocated like the FP32 vector
-    # gate), so accumulating in place is the same FP32 add without a third full-size buffer.
-    assert dq.dtype == torch.float32 and dk.dtype == torch.float32
-    dq.add_(intra_dq)
-    dk.add_(intra_dk)
+    # One pass per gradient: the FP32 WY and intra pieces are added, folded back onto each key
+    # head's group, and cast, instead of an add, a group reduction, and a cast.
+    dq = sum_expanded_head_gradients(dq, intra_dq, groups=groups, dtype=q.dtype)
+    dk = sum_expanded_head_gradients(dk, intra_dk, groups=groups, dtype=k.dtype)
     del intra_dq, intra_dk
-    if groups > 1:
-        dq = dq.view(*q.shape[:2], q.shape[2], groups, q.shape[3]).sum(3)
-        dk = dk.view(*k.shape[:2], k.shape[2], groups, k.shape[3]).sum(3)
-    dq = dq.to(q.dtype)
-    dk = dk.to(k.dtype)
     db = db + intra_db
     return dq, dk, dv, d_gate, db, d_initial_state
 
