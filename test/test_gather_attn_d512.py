@@ -225,14 +225,16 @@ def test_d512_deterministic_backward(heads, share_kv, batch, with_docs):
 
 
 @pytest.mark.parametrize("heads,share_kv", [(2, False), (17, True)], ids=["generic", "shared"])
-@pytest.mark.parametrize("kernel_options", [None, {"backend": "triton"}], ids=["auto", "triton"])
 @pytest.mark.usefixtures("fresh_compile_cache")
-def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
+def test_d512_torch_compile_fullgraph(heads, share_kv):
+    # Pinned to Triton: compiled auto dispatch now keeps CuTe for the shared 17-head case,
+    # and CuTe's dsink (computed from the bf16 output) misses this file's FP32 sink check,
+    # as eager CuTe already does. Compiled CuTe: test_cute_eligible_auto_fullgraph_training.
     # Stride tuples are Triton constexpr arguments, so each shape specializes independently.
     compiled = torch.compile(gather_attn, fullgraph=True, dynamic=False)
     for seq_len in (17, 33):
         inputs = make_inputs(heads, share_kv, torch.bfloat16, seq_len=seq_len)
-        check_training(inputs, 19, operation=compiled, kernel_options=kernel_options)
+        check_training(inputs, 19, operation=compiled, kernel_options={"backend": "triton"})
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")
@@ -249,13 +251,13 @@ def test_cute_eligible_auto_fullgraph_training():
     ):
         pytest.skip("SM100 or SM103 required")
     if not _fa4_available(with_sink=False):
-        pytest.skip("FA4 required to exercise compile-driven fallback")
+        pytest.skip("FA4 required to exercise compiled CuTe dispatch")
     torch.manual_seed(0)
     inputs = make_inputs(128, True, torch.bfloat16, seq_len=17, topk=2, with_docs=False)
     assert _select_backend(inputs.query, None, True, num_keys=21) == "cute"
-    # Omit the sink: both the metadata and installed FA4 permit CuTe outside compilation.
+    # Omit the sink: both the metadata and installed FA4 permit CuTe.
     args = inputs[:4]
-    expected = gather_attn(*args, sliding_window_size=19, kernel_options={"backend": "triton"})
+    expected = gather_attn(*args, sliding_window_size=19)
     compiled = torch.compile(gather_attn, fullgraph=True, dynamic=False)
     actual = compiled(*args, sliding_window_size=19)
     assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
@@ -268,7 +270,7 @@ def test_cute_eligible_auto_fullgraph_training():
     actual_grads = torch.autograd.grad(actual, inputs[:3], grad_output)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(actual_grads[0], expected_grads[0], atol=0, rtol=0)
-    # Match the existing compiled/eager shared-KV reduction and atomic-accumulation budgets.
+    # FA4 accumulates shared dKV atomically, so reruns differ by rounding.
     torch.testing.assert_close(actual_grads[1], expected_grads[1], atol=0.01, rtol=0.01)
     torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
 

@@ -4,8 +4,6 @@ Tests for the CuTe DSL (SM100/SM103) backend of gather attention.
 Validates forward and backward precision against an FP64 eager baseline.
 CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
 Fewer than 128 heads require FA4's sparse-MLA head-padding support.
-
-Note: torch.compile is NOT supported for the CuTe backend (eager-only).
 """
 
 import inspect
@@ -531,3 +529,134 @@ def test_cute_lse_matches_manual_computation(sink_dtype, scale):
     assert lse_eager.shape == (batch, heads, seq_len)
     # CuTe operates in bf16/fp32 so allow tolerance comparable to the forward output.
     torch.testing.assert_close(lse_cute.double(), lse_eager, atol=0.05, rtol=0.02)
+
+
+# ---------------------------------------------------------------------------
+# Opaque operators: torch.compile and fake-tensor tracing
+# ---------------------------------------------------------------------------
+
+
+def _operator_inputs(packed: bool, heads: int = 64) -> tuple[torch.Tensor | None, ...]:
+    """DeepSeek-V4-like operands: shared 512-d KV, window 128, padded top-k indices."""
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
+
+    _skip_no_sm100()
+    if not _fa4_available(with_sink=True, padded_heads=heads != 128):
+        pytest.skip("installed FA4 does not support the requested sparse-MLA features")
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    seq_len, sparse_seq_len, num_topk = 256, 64, 32
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device="cuda", dtype=dtype, generator=gen)
+
+    # Packed documents index their own sparse pool; -1 pads the top-k list.
+    kv_indices = torch.randint(
+        -1, sparse_seq_len // 2, (1, seq_len, num_topk), device="cuda", generator=gen
+    ).int()
+    offsets = (
+        (
+            torch.tensor([0, 100, seq_len], device="cuda", dtype=torch.int32),
+            torch.tensor(
+                [0, sparse_seq_len // 2, sparse_seq_len], device="cuda", dtype=torch.int32
+            ),
+        )
+        if packed
+        else (None, None)
+    )
+    return (
+        randn(1, heads, seq_len, 512),
+        randn(1, 1, seq_len, 512),
+        randn(1, 1, sparse_seq_len, 512),
+        kv_indices,
+        randn(heads, dtype=torch.float32),
+        *offsets,
+        randn(1, heads, seq_len, 512),
+    )
+
+
+@pytest.mark.parametrize("bwd_recompute_p", [True, False], ids=["recompute-p", "saved-p"])
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_cute_operator_contracts(packed, bwd_recompute_p):
+    """Both opaque operators match their fakes (including strides) and AOT dispatch."""
+    from attn_gym.sparse.gather_attn.impl.cute import (
+        _gather_attn_cute_bwd_op,
+        _gather_attn_cute_fwd_op,
+    )
+
+    *tensors, grad_output = _operator_inputs(packed)
+    args = (*tensors, 128, 512**-0.5, bwd_recompute_p)
+    for needs_backward in (False, True):
+        torch.library.opcheck(_gather_attn_cute_fwd_op, (*args, needs_backward))
+    saved = _gather_attn_cute_fwd_op(*args, True)
+    torch.library.opcheck(
+        _gather_attn_cute_bwd_op, (*tensors, *saved, grad_output, *args[len(tensors) :])
+    )
+
+
+def _attend(query, local_kv, sparse_kv, kv_indices, sink, cu_seqlens, cu_seqlens_k):
+    return gather_attn(
+        query,
+        local_kv,
+        sparse_kv,
+        kv_indices,
+        sink,
+        sliding_window_size=128,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_cute_fullgraph_compile_keeps_cute(packed):
+    """Compiled calls trace the CuTe operators and match eager forward and backward."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    query, local_kv, sparse_kv, kv_indices, sink, cu_q, cu_k, grad_output = _operator_inputs(
+        packed
+    )
+    targets = set()
+
+    def record(graph_module, example_inputs):
+        targets.update(str(node.target) for node in graph_module.graph.nodes)
+        return make_boxed_func(graph_module.forward)
+
+    def run(fn):
+        leaves = [tensor.clone().requires_grad_() for tensor in (query, local_kv, sparse_kv, sink)]
+        out = fn(*leaves[:3], kv_indices, leaves[3], cu_q, cu_k)
+        return out, *torch.autograd.grad(out, leaves, grad_output)
+
+    expected = run(_attend)
+    backend = aot_autograd(fw_compiler=record, bw_compiler=record)
+    actual = run(torch.compile(_attend, backend=backend, fullgraph=True))
+    assert {
+        "attn_gym._gather_attn_cute_fwd.default",
+        "attn_gym._gather_attn_cute_bwd.default",
+    } <= targets
+    # Output, dq and dsink are deterministic; FA4 accumulates shared dKV atomically.
+    for i in (0, 1, 4):
+        torch.testing.assert_close(actual[i], expected[i], atol=0, rtol=0)
+    for i in (2, 3):
+        torch.testing.assert_close(actual[i], expected[i])
+
+
+def test_cute_fake_tensor_tracing():
+    """Non-strict fake-tensor tracers (make_fx) record both CuTe operators."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    query, local_kv, sparse_kv, kv_indices, sink, cu_q, cu_k, grad_output = _operator_inputs(
+        packed=True
+    )
+
+    def step(query, local_kv, sparse_kv, kv_indices, sink, cu_q, cu_k, grad_output):
+        out = _attend(query, local_kv, sparse_kv, kv_indices, sink, cu_q, cu_k)
+        return torch.autograd.grad(out, (query, local_kv, sparse_kv, sink), grad_output)
+
+    leaves = [tensor.requires_grad_() for tensor in (query, local_kv, sparse_kv, sink)]
+    graph = make_fx(step, tracing_mode="fake")(
+        *leaves[:3], kv_indices, leaves[3], cu_q, cu_k, grad_output
+    ).graph
+    assert {
+        "attn_gym._gather_attn_cute_fwd.default",
+        "attn_gym._gather_attn_cute_bwd.default",
+    } <= {str(node.target) for node in graph.nodes}

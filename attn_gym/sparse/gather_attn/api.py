@@ -170,13 +170,9 @@ def _select_backend(
     num_keys: int,
 ) -> str:
     """Choose a CUDA backend after public input validation."""
-    # FA4's Python launcher is eager-only, and its sparse backward does not implement
-    # deterministic accumulation. Keep both contracts on the portable Triton path.
-    if (
-        torch.compiler.is_compiling()
-        or torch.are_deterministic_algorithms_enabled()
-        or num_keys == 0
-    ):
+    # FA4's sparse backward does not implement deterministic accumulation; keep that
+    # contract, and empty attention sets, on the portable Triton path.
+    if torch.are_deterministic_algorithms_enabled() or num_keys == 0:
         return "triton"
 
     from .impl import cute as cute_backend
@@ -290,9 +286,9 @@ def gather_attn(
             probabilities; False saves them in forward instead (bf16, tokens x heads x keys),
             trading that memory for a few percent of backward time. Triton always
             recomputes and ignores this option.
-            Compiled calls, deterministic mode, and empty attention sets use Triton
-            automatically. Explicit backend requests are honored; execution failures are never
-            retried on another backend. Nonempty options are invalid with Impl.REFERENCE.
+            Deterministic mode and empty attention sets use Triton automatically. Explicit
+            backend requests are honored; execution failures are never retried on another
+            backend. Nonempty options are invalid with Impl.REFERENCE.
             Triton shared-KV backward uses nondeterministic atomic accumulation unless
             torch.use_deterministic_algorithms is enabled.
 
