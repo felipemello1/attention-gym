@@ -84,13 +84,11 @@ def test_unsupported_metadata_uses_triton(
     fa4_available.assert_not_called()
 
 
-@pytest.mark.parametrize("constraint", ["compiling", "deterministic", "missing_fa4", "empty_keys"])
+@pytest.mark.parametrize("constraint", ["deterministic", "missing_fa4", "empty_keys"])
 def test_auto_fallback_calls_triton(
     cuda_inputs, fa4_available, triton_backend, monkeypatch, constraint
 ):
-    if constraint == "compiling":
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    elif constraint == "deterministic":
+    if constraint == "deterministic":
         monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     elif constraint == "missing_fa4":
         fa4_available.return_value = False
@@ -123,12 +121,18 @@ def test_explicit_implementation_is_honored(
     fa4_available.assert_not_called()
 
 
-@pytest.mark.parametrize("constraint", ["compiling", "deterministic"])
-def test_explicit_cute_bypasses_auto_policy(cuda_inputs, fa4_available, monkeypatch, constraint):
-    if constraint == "compiling":
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    else:
-        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+def test_compiling_prefers_cute(cuda_inputs, fa4_available, monkeypatch):
+    """Compiled and fake-traced calls keep the opaque CuTe operators."""
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    query = cuda_inputs["query"]
+    launch = Mock(return_value=(query, None))
+    monkeypatch.setattr(cute, "gather_attn", launch)
+    assert gather_attn(**cuda_inputs) is query
+    launch.assert_called_once()
+
+
+def test_explicit_cute_bypasses_auto_policy(cuda_inputs, fa4_available, monkeypatch):
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
     monkeypatch.setattr(cute, "gather_attn", launch)

@@ -1,5 +1,7 @@
 """Packed gather attention uses document-local indices and matches independent documents."""
 
+import functools
+
 import pytest
 import torch
 
@@ -439,22 +441,21 @@ def test_packed_cute_native_varlen_replays_offsets_and_gradients(monkeypatch):
     _device("cute")
     from flash_attn.cute import interface
 
-    native = interface.flash_attn_varlen_func
+    native = interface._flash_attn_fwd
     called = False
 
-    def check_native(*args, **kwargs):
+    @functools.wraps(native)  # Keeps FA4's compile_cache attribute.
+    def check_native(q, k, v, **kwargs):
         nonlocal called
         called = True
-        assert kwargs["q"].ndim == 3
+        # Shared 512-d KV selects sparse MLA: no separate q/k, the query is qv.
+        assert q is None and k is None
+        assert kwargs["qv"].ndim == 3 and v.ndim == 3
         assert kwargs["gather_kv_indices"].ndim == 2
-        assert kwargs["k"] is kwargs["v"]
-        return native(*args, **kwargs)
+        assert kwargs["cu_seqlens_q"] is not None and kwargs["cu_seqlens_k"] is not None
+        return native(q, k, v, **kwargs)
 
-    def reject_flat(*args, **kwargs):
-        raise AssertionError("Packed attention must not flatten away document boundaries")
-
-    monkeypatch.setattr(interface, "flash_attn_varlen_func", check_native)
-    monkeypatch.setattr(interface, "flash_attn_func", reject_flat)
+    monkeypatch.setattr(interface, "_flash_attn_fwd", check_native)
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512, capacity=3)
     q, local, sparse, sink = tensors
     grad = torch.randn_like(q) * 0.2
@@ -501,17 +502,19 @@ def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
     _device("cute")
     from flash_attn.cute import interface
 
-    native = interface.flash_attn_varlen_func
-    native_queries = []
+    native = interface._flash_attn_bwd_sparse_mla
+    native_query_grads = []
 
-    def capture_query(*args, **kwargs):
-        native_queries.append(kwargs["q"])
-        return native(*args, **kwargs)
+    @functools.wraps(native)  # Keeps FA4's compile_cache attribute.
+    def capture_query_grad(*args, **kwargs):
+        grads = native(*args, **kwargs)
+        native_query_grads.append(grads[3])
+        return grads
 
-    monkeypatch.setattr(interface, "flash_attn_varlen_func", capture_query)
+    monkeypatch.setattr(interface, "_flash_attn_bwd_sparse_mla", capture_query_grad)
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512)
     query, local, sparse, sink = tensors
-    gather_attn(
+    output = gather_attn(
         query,
         local,
         sparse,
@@ -522,9 +525,8 @@ def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
         cu_seqlens_k=cu_k,
         kernel_options={"backend": "cute"},
     )
-    incoming = torch.randn_like(native_queries[0])
-    (grad_query,) = torch.autograd.grad(native_queries[0], query, incoming)
-    torch.testing.assert_close(grad_query, incoming.transpose(0, 1).unsqueeze(0))
-    grad_storage = grad_query.untyped_storage().data_ptr()
-    incoming_storage = incoming.untyped_storage().data_ptr()
-    assert grad_storage == incoming_storage
+    (grad_query,) = torch.autograd.grad(output, query, torch.randn_like(output))
+    (native_grad,) = native_query_grads
+    assert native_grad.ndim == 3
+    torch.testing.assert_close(grad_query, native_grad.transpose(0, 1).unsqueeze(0))
+    assert grad_query.untyped_storage().data_ptr() == native_grad.untyped_storage().data_ptr()
