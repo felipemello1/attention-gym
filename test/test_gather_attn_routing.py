@@ -1,5 +1,6 @@
 """CPU-only dispatch coverage using CUDA fake tensors, without launching kernels."""
 
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -227,3 +228,17 @@ def test_probe_old_fa4_head_limit(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_attn.cute.pack_gqa", None)
     assert cute._fa4_available(False)
     assert not cute._fa4_available(False, padded_heads=True)
+
+
+def test_import_registers_cute_operators():
+    """Callers can name the CuTe operators (e.g. in a checkpointing save list) before any call."""
+    code = """
+import sys
+import torch
+import attn_gym.sparse.gather_attn
+
+assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_fwd")
+assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_bwd")
+assert not any(name.startswith("flash_attn") for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
