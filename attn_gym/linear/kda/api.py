@@ -25,6 +25,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
+    validate_replay_state,
 )
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.cudnn import chunk_forward as _cudnn_chunk_forward
@@ -277,57 +278,9 @@ def paged_chunk_kda(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     if replay_state is not None:
-        replay_state = ReplayState(*replay_state)
         if options.backend != "fused":
             raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
-        num_slots = state_cache.shape[0]
-        for name, tensor, expected_dtype, expected_shape in zip(
-            ("q", "k", "v", "gate", "beta"),
-            replay_state[:-1],
-            (
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float32,
-                torch.float32,
-            ),
-            (
-                (num_slots, _CHUNK_SIZE, *q.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *k.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *v.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *gate.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *beta.shape[2:]),
-            ),
-            strict=True,
-        ):
-            if tensor.shape != expected_shape:
-                raise ValueError(
-                    f"replay_state {name} tensor must have shape {expected_shape}, "
-                    f"got {tuple(tensor.shape)}"
-                )
-            if tensor.dtype != expected_dtype or tensor.device != q.device:
-                raise TypeError(
-                    f"replay_state {name} tensor must use {expected_dtype} on the input device"
-                )
-            expected_stride = 1
-            dense_inner = True
-            for size, stride in reversed(tuple(zip(tensor.shape[2:], tensor.stride()[2:]))):
-                dense_inner &= size == 1 or stride == expected_stride
-                expected_stride *= size
-            if not dense_inner or tensor.stride(1) != expected_stride:
-                raise ValueError(f"replay_state {name} tensor must have dense per-token rows")
-            if num_slots > 1 and tensor.stride(0) < _CHUNK_SIZE * expected_stride:
-                raise ValueError(f"replay_state {name} tensor slots must not overlap")
-        if replay_state.count.shape not in ((num_slots,), (num_slots, 1)):
-            raise ValueError(
-                f"replay_state count tensor must have shape ({num_slots},) or "
-                f"({num_slots}, 1), got {tuple(replay_state.count.shape)}"
-            )
-        if replay_state.count.dtype != torch.int32 or replay_state.count.device != q.device:
-            raise TypeError("replay_state count tensor must be int32 on the input device")
-        if num_slots > 1 and replay_state.count.stride(0) == 0:
-            raise ValueError("replay_state count tensor slots must not overlap")
-        # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
+        replay_state = validate_replay_state(q, k, v, gate, beta, state_cache, replay_state)
     if options.backend == "cudnn":
         return _cudnn_paged_chunk_forward(
             q,
