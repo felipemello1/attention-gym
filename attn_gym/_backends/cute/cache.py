@@ -13,6 +13,7 @@ upstream ``CUTE_DSL_NO_CACHE`` switch is still respected.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import enum
 import errno
 import functools
@@ -23,6 +24,7 @@ import pickle
 import tempfile
 import threading
 import time
+import types
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +33,7 @@ from typing import Any, ParamSpec, TypeVar
 import torch
 from typing_extensions import Self
 
+from ._key import function_cache_key as _function_cache_key
 from ._key import make_key as _make_key
 from ._key import make_runtime_key as _make_runtime_key
 from ._key import source_fingerprint as _source_fingerprint
@@ -226,12 +229,29 @@ def _target_key(target: CompileTarget) -> bytes:
     return pickle.dumps(target, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def _fast_key(item: Any) -> tuple[Any, ...] | None:
-    """Key a plain static value without pickling, or return None to use the pickled key.
+@functools.cache
+def _dataclass_fields(item_type: type) -> tuple[str, ...] | None:
+    """Return a dataclass type's field names, or None for any other type."""
+    if not dataclasses.is_dataclass(item_type):
+        return None
+    return tuple(field.name for field in dataclasses.fields(item_type))
 
-    Tagging each value with its type keeps values that compare equal across types
-    (``True == 1``) apart, as the pickled key does. Floats key on ``float.hex`` so ``0.0`` and
-    ``-0.0`` differ; NaN payloads all hex to ``'nan'``, so NaN takes the pickled key.
+
+def _function_key(function: types.FunctionType) -> bytes:
+    """Key a function by source and current captured values, as the slow key does.
+
+    Pickled because tuples compare values, not types: ``(True,) == (1,)``.
+    """
+    return pickle.dumps(_function_cache_key(function), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _fast_key(item: Any) -> tuple[Any, ...] | None:
+    """Key an argument without the slow pickled key, or return None to use it.
+
+    - scalars, dtypes, enums: ``(type, value)``; floats use ``float.hex``, NaN falls back.
+    - tuples and dataclasses: element by element.
+    - functions: ``_function_key``.
+    - values with ``__attention_gym_cache_key__``: fall back, so the hook decides.
     """
     item_type = type(item)
     # One set lookup, not a chain of isinstance class patterns: this runs per value per launch.
@@ -243,6 +263,13 @@ def _fast_key(item: Any) -> tuple[Any, ...] | None:
         case tuple() if item_type is tuple:  # NamedTuples keep their type via the pickled key.
             parts = tuple(map(_fast_key, item))
             return None if None in parts else (tuple, *parts)
+        case _ if getattr(item, "__attention_gym_cache_key__", None) is not None:
+            return None
+        case types.FunctionType():
+            return (item_type, _function_key(item))
+        case _ if (fields := _dataclass_fields(item_type)) is not None:
+            parts = tuple(_fast_key(getattr(item, name)) for name in fields)
+            return None if None in parts else (item_type, *parts)
         case _:
             return None
 

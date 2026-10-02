@@ -251,7 +251,12 @@ def _pickle_sort_key(item: Any) -> bytes:
     return pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+_SCALAR_TYPES = frozenset({int, bool, float, str, bytes, type(None)})
+
+
 def _canonicalize(item: Any) -> Any:
+    if type(item) in _SCALAR_TYPES:  # Fast path: skip the checks below; the result is the same.
+        return item
     custom_key = getattr(item, "__attention_gym_cache_key__", None)
     if custom_key is not None:
         value = custom_key() if callable(custom_key) else custom_key

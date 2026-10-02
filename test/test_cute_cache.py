@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import multiprocessing
 import os
@@ -846,6 +847,54 @@ def test_runtime_cache_snapshots_mutable_arguments(isolated_cache):
     compile_kernel.cache_clear()
     assert compile_kernel(["first"])() == "first"
     assert compile_count == 2
+
+
+@dataclasses.dataclass(frozen=True)
+class _LaunchShape:
+    threads: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookedLaunchShape:
+    threads: int
+
+    def __attention_gym_cache_key__(self):
+        return self.threads, _KERNEL_SCALE
+
+
+_KERNEL_SCALE = 2.0
+
+
+def _scaled(value):
+    return value * _KERNEL_SCALE
+
+
+def test_runtime_cache_fast_keys_dataclass_and_function_arguments(isolated_cache, monkeypatch):
+    """Dataclass and function arguments skip the pickled key; a function still keys on the
+    current values of the globals it reads."""
+
+    def pickled_runtime_key(*args):
+        raise AssertionError("dataclass and function arguments should take the fast key")
+
+    monkeypatch.setattr(cute_cache, "_make_runtime_key", pickled_runtime_key)
+
+    @cute_cache.jit_cache
+    def compile_kernel(shape, function) -> FakeCompiled:
+        return FakeCompiled(f"{shape.threads}/{function(1.0)}")
+
+    assert compile_kernel(_LaunchShape(128), _scaled)() == "128/2.0"
+    monkeypatch.setattr(sys.modules[__name__], "_KERNEL_SCALE", 3.0)
+    assert compile_kernel(_LaunchShape(128), _scaled)() == "128/3.0"
+
+
+def test_runtime_cache_honors_dataclass_cache_key_hook(isolated_cache, monkeypatch):
+    @cute_cache.jit_cache
+    def compile_kernel(shape) -> FakeCompiled:
+        return FakeCompiled(f"{shape.threads}/{_KERNEL_SCALE}")
+
+    assert compile_kernel(_HookedLaunchShape(128))() == "128/2.0"
+    monkeypatch.setattr(sys.modules[__name__], "_KERNEL_SCALE", 3.0)
+    assert compile_kernel(_HookedLaunchShape(128))() == "128/3.0"
 
 
 def test_same_key_compiles_once_across_threads(isolated_cache):
