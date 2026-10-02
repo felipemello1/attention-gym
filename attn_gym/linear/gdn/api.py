@@ -10,16 +10,17 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
+    validate_replay_state,
 )
 from attn_gym.linear.gdn.impl.cudnn import chunk_forward as cudnn_chunk_forward
 from attn_gym.linear.gdn.impl.cudnn import paged_chunk_forward as cudnn_paged_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
-from attn_gym.linear.gdn.ops import recurrent_decode_forward
+from attn_gym.linear.gdn.ops import paged_chunk_replay_forward, recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
-from attn_gym.linear.types import Impl, resolve_impl
+from attn_gym.linear.types import Impl, ReplayState, resolve_impl
 from attn_gym.linear.types import SplitOptions as KernelOptions
 
 
@@ -133,6 +134,7 @@ def paged_chunk_gdn(
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
     kernel_options: KernelOptions | None = None,
+    replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
@@ -161,6 +163,14 @@ def paged_chunk_gdn(
             ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
             supported.
+        replay_state: Optional :class:`ReplayState`, as in :func:`paged_chunk_kda`: token
+            caches shaped ``[num_slots, 64, ...]`` like the inputs and int32 counts that start
+            at zero. ``state_cache`` then holds the state at the last 64-token chunk boundary
+            and ``replay_state`` the tokens since, so pass both on every call. With BF16 inputs
+            and an FP32 ``state_cache``, outputs are bitwise equal to the default ``chunk_gdn``
+            over the whole sequence, whatever the batch. Decode (``[B, 1]`` inputs without
+            ``cu_seqlens``) reruns the chunk kernel, so it is slower than recurrent decode.
+            Requires the fused backend.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -177,6 +187,23 @@ def paged_chunk_gdn(
         state_indices,
         has_initial_state,
     )
+    if replay_state is not None:
+        if options.backend != "fused":
+            raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
+        replay_state = validate_replay_state(q, k, v, gate, beta, state_cache, replay_state)
+        return paged_chunk_replay_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            replay_state,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            scale=resolve_scale(scale, q.shape[-1]),
+        )
     paged_chunk_forward = (
         cudnn_paged_chunk_forward if options.backend == "cudnn" else fused_paged_chunk_forward
     )

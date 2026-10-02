@@ -15,7 +15,7 @@ from attn_gym.types import Impl, resolve_impl
 
 
 class ReplayState(NamedTuple):
-    """Persistent token cache used by replay-backed paged KDA.
+    """Persistent token cache used by replay-backed paged KDA and GDN.
 
     The Q, K, and V caches use BF16, gate and beta use FP32, and count uses int32.
     """
