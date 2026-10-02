@@ -11,11 +11,12 @@ from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_gdn`` backend selection and cuDNN split switches."""
+    """Validated ``chunk_gdn`` backend selection and backend-specific switches."""
 
     backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
+    save_chunk_states: bool = False
 
 
 def resolve_kernel_options(
@@ -39,7 +40,12 @@ def resolve_kernel_options(
         if value and backend != "cudnn":
             raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
         splits.append(value)
-    return ResolvedKernelOptions(backend, *splits)
+    save_chunk_states = kernel_options.get("save_chunk_states", False)
+    if not isinstance(save_chunk_states, bool):
+        raise TypeError("kernel_options['save_chunk_states'] must be a bool")
+    if save_chunk_states and backend != "fused":
+        raise ValueError("save_chunk_states requires kernel_options['backend']='fused'")
+    return ResolvedKernelOptions(backend, *splits, save_chunk_states)
 
 
 def validate_gdn_inputs(
