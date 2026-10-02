@@ -11,6 +11,7 @@ import torch
 
 from attn_gym._backends.cute import normalize_tma_rows
 from attn_gym.linear import (
+    ReplayState,
     active_token_mask,
     chunk_gdn,
     mask_inactive_token_gradients,
@@ -630,6 +631,69 @@ def test_paged_chunk_handles_padding_and_empty_fresh_slots():
     torch.testing.assert_close(
         state_cache[[0, 1, 2, 4]], original_cache[[0, 1, 2, 4]], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    ("prompt_lengths", "slots"),
+    [((63,), (2,)), ((130, 64, 60, 1, 5), (2, 3, 4, 1, 0))],
+    ids=["one_sequence", "mixed_batch_with_padding"],
+)
+def test_paged_chunk_replay_matches_each_sequence_alone(prompt_lengths, slots):
+    """Chunked replay prefill and batched decode reproduce chunk_gdn per sequence, bitwise."""
+    decode_tokens = 12
+    inputs = make_inputs(
+        batch=len(slots),
+        tokens=max(prompt_lengths) + decode_tokens,
+        key_heads=2,
+        value_heads=4,
+    )[:5]
+    state_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
+    num_slots = max(slots) + 1
+    state_cache = torch.randn(num_slots, 4, 128, 128, device="cuda")
+    # Stale slot contents must be ignored by fresh sequences.
+    replay_state = ReplayState(
+        *(torch.randn(num_slots, 64, *x.shape[2:], device="cuda").bfloat16() for x in inputs[:3]),
+        *(torch.rand(num_slots, 64, *x.shape[2:], device="cuda") for x in inputs[3:]),
+        torch.full((num_slots,), 7, device="cuda", dtype=torch.int32),
+    )
+    null_slot = state_cache[0].clone()
+
+    def prefill(starts, ends, has_initial_state):
+        """Feed tokens [starts[i], ends[i]) of each sequence in one packed call."""
+        rows = list(enumerate(zip(starts, ends, strict=True)))
+        lengths = [end - start for _, (start, end) in rows]
+        output = paged_chunk_gdn(
+            *(torch.cat([x[i, start:end] for i, (start, end) in rows])[None] for x in inputs),
+            state_cache,
+            state_indices,
+            cu_seqlens=cumulative_sequence_offsets(lengths, device="cuda"),
+            has_initial_state=torch.full((len(slots),), has_initial_state, device="cuda"),
+            replay_state=replay_state,
+        )
+        return output[0].split(lengths)
+
+    def next_tokens(x, step):
+        return torch.stack([x[i, n + step] for i, n in enumerate(prompt_lengths)])[:, None]
+
+    halves = [n // 2 for n in prompt_lengths]
+    with torch.no_grad():
+        first = prefill([0] * len(slots), halves, has_initial_state=False)
+        second = prefill(halves, prompt_lengths, has_initial_state=True)
+        decode = [
+            paged_chunk_gdn(
+                *(next_tokens(x, step) for x in inputs),
+                state_cache,
+                state_indices,
+                replay_state=replay_state,
+            )
+            for step in range(decode_tokens)
+        ]
+        for i, (tokens, slot) in enumerate(zip(prompt_lengths, slots, strict=True)):
+            actual = torch.cat([first[i], second[i], *(d[i] for d in decode)])
+            expected, _ = chunk_gdn(*(x[i : i + 1, : tokens + decode_tokens] for x in inputs))
+            expected = expected[0] if slot > 0 else torch.zeros_like(actual)
+            assert torch.equal(actual, expected), f"prompt length {tokens}"
+    assert torch.equal(state_cache[0], null_slot)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
