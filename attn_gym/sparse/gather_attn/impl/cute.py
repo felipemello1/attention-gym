@@ -27,6 +27,8 @@ from functools import cache
 
 import torch
 
+from . import cute_ops  # noqa: F401  (operator schemas)
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -107,21 +109,7 @@ def _check_backward_mode() -> None:
 # Opaque operators
 # ---------------------------------------------------------------------------
 
-torch.library.define(
-    "attn_gym::_gather_attn_cute_fwd",
-    "(Tensor query, Tensor local_kv, Tensor sparse_kv, Tensor kv_indices, "
-    "Tensor? attention_sink, Tensor? cu_seqlens, Tensor? cu_seqlens_k, "
-    "int sliding_window_size, float scale, bool bwd_recompute_p, bool needs_backward) "
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
-)
-torch.library.define(
-    "attn_gym::_gather_attn_cute_bwd",
-    "(Tensor query, Tensor local_kv, Tensor sparse_kv, Tensor kv_indices, "
-    "Tensor? attention_sink, Tensor? cu_seqlens, Tensor? cu_seqlens_k, Tensor output, "
-    "Tensor lse, Tensor p, Tensor row_max, Tensor o_lo, Tensor grad_output, "
-    "int sliding_window_size, float scale, bool bwd_recompute_p) "
-    "-> (Tensor, Tensor, Tensor, Tensor)",
-)
+# The schemas are defined in cute_ops.py, which the package imports eagerly.
 
 
 def _to_fa4_layout(tensor: torch.Tensor, packed: bool) -> torch.Tensor:

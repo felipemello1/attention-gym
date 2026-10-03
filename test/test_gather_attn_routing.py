@@ -241,4 +241,4 @@ assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_fwd")
 assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_bwd")
 assert not any(name.startswith("flash_attn") for name in sys.modules)
 """
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
