@@ -231,14 +231,32 @@ def test_probe_old_fa4_head_limit(monkeypatch):
 
 
 def test_import_registers_cute_operators():
-    """Callers can name the CuTe operators (e.g. in a checkpointing save list) before any call."""
+    """Importing the package registers complete CuTe operators without loading impl/cute.py.
+
+    Callers can name them (e.g. in a checkpointing save list) or trace and run graphs that
+    contain them (e.g. a deserialized graph) before any gather_attn call.
+    """
     code = """
 import sys
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 import attn_gym.sparse.gather_attn
 
-assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_fwd")
-assert hasattr(torch.ops.attn_gym, "_gather_attn_cute_bwd")
+ops = torch.ops.attn_gym
+with FakeTensorMode():
+    query = torch.empty(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16)
+    local_kv = torch.empty(1, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sparse_kv = torch.empty(1, 1, 4, 512, device="cuda", dtype=torch.bfloat16)
+    kv_indices = torch.empty(1, 8, 2, device="cuda", dtype=torch.int32)
+    sink = torch.empty(128, device="cuda", dtype=torch.float32)
+    fwd = ops._gather_attn_cute_fwd(
+        query, local_kv, sparse_kv, kv_indices, sink, None, None, 4, 1.0, True, True
+    )
+    bwd = ops._gather_attn_cute_bwd(
+        query, local_kv, sparse_kv, kv_indices, sink, None, None, *fwd, fwd[0], 4, 1.0, True
+    )
+assert fwd[0].shape == query.shape and bwd[0].shape == query.shape
+assert "attn_gym.sparse.gather_attn.impl.cute" not in sys.modules
 assert not any(name.startswith("flash_attn") for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
