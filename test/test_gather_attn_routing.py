@@ -1,5 +1,6 @@
 """CPU-only dispatch coverage using CUDA fake tensors, without launching kernels."""
 
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -227,3 +228,35 @@ def test_probe_old_fa4_head_limit(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_attn.cute.pack_gqa", None)
     assert cute._fa4_available(False)
     assert not cute._fa4_available(False, padded_heads=True)
+
+
+def test_import_registers_cute_operators():
+    """Importing the package registers complete CuTe operators without loading impl/cute.py.
+
+    Callers can name them (e.g. in a checkpointing save list) or trace and run graphs that
+    contain them (e.g. a deserialized graph) before any gather_attn call.
+    """
+    code = """
+import sys
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+import attn_gym.sparse.gather_attn
+
+ops = torch.ops.attn_gym
+with FakeTensorMode():
+    query = torch.empty(1, 128, 8, 512, device="cuda", dtype=torch.bfloat16)
+    local_kv = torch.empty(1, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sparse_kv = torch.empty(1, 1, 4, 512, device="cuda", dtype=torch.bfloat16)
+    kv_indices = torch.empty(1, 8, 2, device="cuda", dtype=torch.int32)
+    sink = torch.empty(128, device="cuda", dtype=torch.float32)
+    fwd = ops._gather_attn_cute_fwd(
+        query, local_kv, sparse_kv, kv_indices, sink, None, None, 4, 1.0, True, True
+    )
+    bwd = ops._gather_attn_cute_bwd(
+        query, local_kv, sparse_kv, kv_indices, sink, None, None, *fwd, fwd[0], 4, 1.0, True
+    )
+assert fwd[0].shape == query.shape and bwd[0].shape == query.shape
+assert "attn_gym.sparse.gather_attn.impl.cute" not in sys.modules
+assert not any(name.startswith("flash_attn") for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
