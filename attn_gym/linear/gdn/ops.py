@@ -12,6 +12,14 @@ from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_meta
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
+from attn_gym.linear.kda.ops import (
+    chunk_replay_commit_op,
+    chunk_replay_prefill_commit_op,
+    chunk_replay_prefill_prepare_op,
+    chunk_replay_prepare_op,
+    chunk_replay_state_gather_op,
+)
+from attn_gym.linear.types import ReplayState
 
 _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
@@ -575,6 +583,88 @@ def paged_chunk_forward(
         scale,
     )
     return output.reshape(output_shape)
+
+
+def paged_chunk_replay_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    replay_state: ReplayState,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Advance paged chunk GDN so outputs match ``chunk_gdn`` over the whole sequence bitwise.
+
+    Every token is computed in the same 64-token chunk, from the same chunk-start state, as in
+    ``chunk_gdn``. Reuses KDA's shape-generic replay operators.
+    """
+    _validate_fused_chunk_qkv(q, k, v)
+    require_inference_only(
+        (q, k, v, gate, beta, state_cache, *replay_state),
+        "paged_chunk_gdn is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
+    inputs = (q.bfloat16(), k.bfloat16(), v.bfloat16(), gate.float(), beta.float())
+    if cu_seqlens is None and q.shape[1] == 1:
+        # Decode: append each token to its slot's cached chunk, rerun that chunk, and commit
+        # the final state only for chunks that are now complete.
+        *windows, window_state, window_counts = chunk_replay_prepare_op(
+            *inputs, state_cache, *replay_state, state_indices, has_initial_state
+        )
+        output, final_state = chunk_forward(
+            *windows, window_state, cu_seqlens=None, scale=scale, output_final_state=True
+        )
+        chunk_replay_commit_op(
+            final_state,
+            state_indices,
+            has_initial_state,
+            window_counts,
+            state_cache,
+            replay_state.count,
+        )
+        rows = torch.arange(window_counts.shape[0], device=q.device)
+        return output[rows, window_counts].unsqueeze(1).to(q.dtype)
+
+    # Prefill: the cached tokens plus the new ones split into complete chunks, which advance
+    # state_cache through the paged kernel, and an unfinished tail, which runs from the new
+    # chunk-start state and is then cached.
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+    prepared = chunk_replay_prefill_prepare_op(
+        *inputs, state_cache, *replay_state, state_indices, has_initial_state, cu_seqlens
+    )
+    *prefix, prefix_cu_seqlens, output_route = prepared[:7]
+    *tail, tail_counts = prepared[7:]
+    prefix_output = paged_chunk_forward(
+        *prefix,
+        state_cache,
+        state_indices,
+        cu_seqlens=prefix_cu_seqlens,
+        has_initial_state=has_initial_state,
+        scale=scale,
+    )
+    tail_output, _ = chunk_forward(
+        *tail,
+        chunk_replay_state_gather_op(state_cache, state_indices),
+        cu_seqlens=None,
+        scale=scale,
+        output_final_state=False,
+    )
+    return chunk_replay_prefill_commit_op(
+        prefix_output,
+        tail_output,
+        output_route,
+        *tail,
+        tail_counts,
+        state_indices,
+        *replay_state,
+        output_template=v,
+    )
 
 
 def recurrent_forward(
