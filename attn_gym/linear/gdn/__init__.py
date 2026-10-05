@@ -15,6 +15,7 @@ _BACKEND_EXPORTS = {
     "chunk_gdn_prepare": "attn_gym.linear.gdn.stages",
     "chunk_gdn_prepare_backward": "attn_gym.linear.gdn.stages",
     "context_parallel_gdn": "attn_gym.linear.gdn.context_parallel",
+    "prepare_gdn_inputs": "attn_gym.linear.gdn.prepare",
 }
 
 
