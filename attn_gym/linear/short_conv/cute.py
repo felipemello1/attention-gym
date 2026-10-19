@@ -310,8 +310,7 @@ def history_dot(
                 )
             )
         taps[(None, tap)].store(input_value.load())
-    # Accumulate like a token whose window lies inside its sequence (unrolled_dot), so
-    # reading history gives the same bits as decode and as one unsplit prefill.
+    # Sum in the same order as in-sequence windows and decode (newest tap first).
     return unrolled_dot(taps, weights, 0, width)
 
 
