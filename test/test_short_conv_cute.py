@@ -2605,6 +2605,51 @@ def test_paged_short_conv_prefill_continues_in_decode():
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("second_chunk", [1, 3])
+def test_paged_short_conv_history_window_matches_unsplit_sequence(second_chunk: int):
+    """A window that reads paged history gives the unsplit sequence's and decode's bits.
+
+    Token 3's products, oldest first, are 0, 2^-24, 2^-24 and 261/256. Summed newest first,
+    as decode and in-sequence windows do, each 2^-24 is a tie that rounds away and the bf16
+    output ties to even, 1.015625. Summed oldest first, they add to 2^-23 and it rounds up.
+    """
+    channels = 8
+    values = torch.tensor((0, 2**-24, 2**-24, 9 / 8, 1, 1), device="cuda")
+    x = values[: 3 + second_chunk, None].expand(-1, channels).to(torch.bfloat16).contiguous()
+    weight = torch.ones(channels, 4, device="cuda", dtype=torch.bfloat16)
+    weight[:, 3] = 29 / 32
+    slot = torch.tensor((1,), device="cuda", dtype=torch.int32)
+
+    with torch.no_grad():
+        expected = causal_conv1d(x.unsqueeze(0), weight)[0]
+        state = torch.full((2, 3, channels), float("nan"), device="cuda", dtype=x.dtype)
+        decode_state = state.clone()
+        chunks = [
+            paged_causal_conv1d(
+                chunk.unsqueeze(0),
+                weight,
+                state,
+                slot,
+                has_initial_state=torch.tensor((start > 0,), device="cuda"),
+            )[0]
+            for start, chunk in ((0, x[:3]), (3, x[3:]))
+        ]
+        decoded = [
+            causal_conv1d_decode(
+                x[t : t + 1],
+                weight,
+                decode_state,
+                state_indices=slot,
+                has_initial_state=torch.tensor((t > 0,), device="cuda"),
+            )
+            for t in range(x.shape[0])
+        ]
+
+    assert expected[3, 0].item() == 1.015625
+    torch.testing.assert_close(torch.cat(chunks), expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(decoded), expected, rtol=0, atol=0)
+
+
 def test_paged_short_conv_prefill_fullgraph_and_registration():
     """Keep paged mutation opaque under opcheck and strict graph capture."""
     torch.manual_seed(104)
