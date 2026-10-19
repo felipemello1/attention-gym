@@ -285,7 +285,7 @@ def history_dot(
     ``state`` is compact channel-grouped history, or a paged pool when ``state_indices``
     is given.
     """
-    products = cute.make_rmem_tensor((channels_per_thread, width), Float32)
+    taps = cute.make_rmem_tensor((channels_per_thread, width), Float32)
     for tap in cutlass.range_constexpr(width):
         input_time = output_time + tap - (width - 1)
         input_value = cute.make_rmem_tensor((channels_per_thread,), Float32)
@@ -309,12 +309,9 @@ def history_dot(
                     width,
                 )
             )
-        products[(None, tap)].store(input_value.load() * weights[(None, tap)].load())
-    return products.load().reduce(
-        cute.ReductionOp.ADD,
-        Float32(0.0),
-        reduction_profile=(None, 1),
-    )
+        taps[(None, tap)].store(input_value.load())
+    # Sum in the same order as in-sequence windows and decode (newest tap first).
+    return unrolled_dot(taps, weights, 0, width)
 
 
 class ShortConvKernel:

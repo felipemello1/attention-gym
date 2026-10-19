@@ -2605,6 +2605,34 @@ def test_paged_short_conv_prefill_continues_in_decode():
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
+def test_short_conv_history_window_matches_unsplit_sequence():
+    """A window that reads history rounds like the unsplit sequence and like decode.
+
+    Token 3's products, oldest first, are 0, 2^-24, 2^-24 and 261/256. Newest first, each
+    2^-24 is half an fp32 ulp and is dropped (ties to even), and the bf16 output ties to
+    even: 1.015625. Oldest first, they add to 2^-23 and the output rounds up to 1.0234375.
+    """
+    x = torch.tensor((0, 2**-24, 2**-24, 9 / 8), device="cuda")[:, None].expand(-1, 8)
+    x = x.to(torch.bfloat16).contiguous()
+    weight = torch.ones(8, 4, device="cuda", dtype=x.dtype)
+    weight[:, 3] = 29 / 32
+    slot = torch.tensor((1,), device="cuda", dtype=torch.int32)
+    state = torch.zeros(2, 3, 8, device="cuda", dtype=x.dtype)
+
+    with torch.no_grad():
+        expected = causal_conv1d(x[None], weight)[0, 3:]
+        resumed = causal_conv1d(x[None, 3:], weight, initial_state=x[None, :3])[0]
+        # Token 2 of a fresh prefill sees the same products through zero history.
+        fresh = paged_causal_conv1d(x[None, 1:], weight, state.clone(), slot)[0, 2:]
+        paged_causal_conv1d(x[None, :3], weight, state, slot)
+        decoded = causal_conv1d_decode(x[3:], weight, state.clone(), state_indices=slot)
+        paged = paged_causal_conv1d(x[None, 3:], weight, state, slot)[0]
+
+    assert expected.unique().tolist() == [1.015625]
+    for actual in (resumed, fresh, decoded, paged):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_paged_short_conv_prefill_fullgraph_and_registration():
     """Keep paged mutation opaque under opcheck and strict graph capture."""
     torch.manual_seed(104)
