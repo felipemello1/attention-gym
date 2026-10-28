@@ -723,7 +723,7 @@ def test_gdn_cudnn_split_schedules_reject_stateful_calls(option: str) -> None:
 
 
 def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]:
-    """Run exact and split cuDNN GDN fwd+bwd on one long stream; record split work items."""
+    """Run uncut and split cuDNN GDN fwd+bwd on one long stream; record split work items."""
     from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
 
     q, k, value, gate, beta, _state, _ = make_gdn_test_inputs(
@@ -741,6 +741,9 @@ def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]
         output, _ = public_chunk_gdn(*inputs, kernel_options=options)
         return (output, *torch.autograd.grad(output, inputs, d_output))
 
+    # Run the exact path on the uncut plan that split replaces; by default its backward would
+    # chain this stream (4 pieces of 2048).
+    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
     exact = run({"backend": "cudnn"})
     monkeypatch.setattr(fe_gdn, "_work_count", recording_work_count)
     split = run({"backend": "cudnn", "split_forward": True, "split_backward": True})
@@ -757,8 +760,7 @@ def test_gdn_cudnn_split_cuts_a_forgetting_stream_and_matches_exact(monkeypatch)
 
 
 def test_gdn_cudnn_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
-    """A gate that never forgets is not cut. The exact path runs this long stream as an exact
-    piece chain, so the uncut split result matches it to rounding rather than bitwise."""
+    """A gate that never forgets is not cut, so the split result matches the uncut plan."""
     (exact, split), work_counts = _split_work_items(monkeypatch, "near_zero")
     assert work_counts == [exact[0].shape[2]] * 2
     for actual, expected in zip(split, exact, strict=True):
@@ -834,13 +836,40 @@ def test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default(split: bo
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_gdn_cudnn_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
+def test_gdn_cudnn_chain_keeps_the_pieces_that_meet_the_floor() -> None:
+    """Keep the floor-length pieces that fit instead of dropping the chain.
+
+    1x16384, 12 heads, 148 SMs -> budget 12
+      backward  floor 2048: 16384 // 2048 = 8 pieces
+      forward   floor 8192: 2 pieces < 3              -> uncut
+    """
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.cudnn_fe.plan import _chain_pieces
+
+    plan_args = (16384, 1, 12, 148, fe_gdn.B_T)
+    assert _chain_pieces(*plan_args, fe_gdn.MIN_CHAIN_TOKENS_PER_PIECE_BWD, reverse=True)[0] == 8
+    assert _chain_pieces(*plan_args, fe_gdn.MIN_CHAIN_TOKENS_PER_PIECE_FWD)[0] == 0
+
+
+def test_gdn_cudnn_chained_forward_plan_keeps_the_uncut_dv_split() -> None:
+    """A chained forward plan still carries its uncut table's d_v split, which paged calls run."""
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+
+    plan = fe_gdn.ForwardPlan.build(32768, 1, 12, 128, torch.device("cuda"))
+    assert (plan.pieces, plan.tiles_per_head) == (4, 2)
+
+
+# (24576, 4, 8): budget 16, both directions cut to the floor: forward 3 pieces, backward 12.
+@pytest.mark.parametrize("tokens,key_heads,value_heads", [(24576, 16, 48), (24576, 4, 8)])
+def test_gdn_cudnn_exact_chain_matches_uncut_with_state(
+    monkeypatch, tokens: int, key_heads: int, value_heads: int
+) -> None:
     """A long stream on few tiles runs as an exact piece chain in both directions; it must agree
     with the uncut plan on output, final state, and every gradient, including the state ones."""
     from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
 
     q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
-        24576, key_heads=16, value_heads=48, seed=449
+        tokens, key_heads=key_heads, value_heads=value_heads, seed=449
     )
     tokens, heads = q.shape[1], value.shape[2]
     if not fe_gdn.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
