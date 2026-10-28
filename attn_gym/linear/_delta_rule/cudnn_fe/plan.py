@@ -18,7 +18,13 @@ import torch
 from attn_gym._backends.cute.utils import get_device_properties
 
 from .common.host import tensormap_workspace_bytes
-from .common.piece_chain import DV_SPLIT_TILES, choose_pieces, piece_table_layout
+from .common.piece_chain import (
+    CHAIN_MIN_PIECES,
+    CHAIN_MIN_PIECES_REVERSE,
+    DV_SPLIT_TILES,
+    choose_pieces,
+    piece_table_layout,
+)
 from .common.split_k import (
     WORK_ITEM_FIELDS,
     chunk_scratch_rows,
@@ -58,7 +64,13 @@ def _chain_pieces(
     *,
     reverse: bool = False,
 ) -> tuple[int, int]:
-    """``(pieces, unit_chunks)`` of the exact chain, with no chain when pieces would be short."""
+    """``(pieces, unit_chunks)`` of the exact chain: the budget, cut to the pieces that keep
+    ``min_tokens_per_piece`` tokens each (0 keeps the budget); 0 pieces (uncut) below
+    ``CHAIN_MIN_PIECES`` (``CHAIN_MIN_PIECES_REVERSE`` for ``reverse``).
+
+    Example: 1x16384 tokens, budget 12 -> backward (floor 2048) 8 pieces,
+    forward (floor 8192) 2 < 3 -> 0 (uncut).
+    """
     pieces, unit = choose_pieces(
         num_seqs=num_seqs,
         heads_out=heads_out,
@@ -69,7 +81,9 @@ def _chain_pieces(
         batch_invariant=False,
         reverse=reverse,
     )
-    if pieces and tokens < min_tokens_per_piece * pieces * num_seqs:
+    if min_tokens_per_piece:
+        pieces = min(pieces, tokens // (min_tokens_per_piece * num_seqs))
+    if pieces < (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         pieces = 0
     return pieces, unit
 
@@ -77,8 +91,9 @@ def _chain_pieces(
 @dataclass
 class ForwardPlan:
     """Forward scheme for one (shape, device): the exact chain, or an uncut table whose tiles
-    optionally split d_v. Plans are shape-dependent by design; bitwise ownership invariance holds
-    within a plan. Each driver subclasses this with a ``build`` over its own tile size."""
+    optionally split d_v. ``tiles_per_head`` is the uncut table's, kept on chained plans for paged
+    calls, which drop the chain. Plans are shape-dependent by design; bitwise ownership invariance
+    holds within a plan. Each driver subclasses this with a ``build`` over its own tile size."""
 
     pieces: int
     unit_chunks: int
@@ -107,7 +122,7 @@ class ForwardPlan:
         )
         # Upstream splits d_v only at a slot budget of exactly two; any unchained plan whose two
         # CTAs per tile fit in one wave gains (GDN 1x2048: 67 -> 58 us, 1x8192: 220 -> 193 us).
-        dv = not pieces and dim_v == 128 and num_sm // (num_seqs * heads_out) >= DV_SPLIT_TILES
+        dv = dim_v == 128 and num_sm // (num_seqs * heads_out) >= DV_SPLIT_TILES
         return cls(pieces, unit, DV_SPLIT_TILES if dv else 1, num_sm)
 
 

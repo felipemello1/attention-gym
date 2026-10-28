@@ -298,6 +298,16 @@ vendor the new tag.
   fwd+bwd 3207→1670; T32768 H48 fwd+bwd 12748→6297; T2048 H8 fwd 114.5→68.4 (bwd 490.5→496.4,
   +1.2%, inside threshold). GDN bitwise identical to #604. Plan thresholds are GB200-tuned; re-bench
   on new drops.
+- **F1 follow-up — keep the chain pieces that meet the floor; paged calls keep the d_v split.**
+  `_chain_pieces` used to drop the chain when `budget * floor > tokens`. It now keeps
+  `min(budget, tokens // (floor * num_seqs))` pieces, uncut below `CHAIN_MIN_PIECES(_REVERSE)`.
+  The d_v split is decided without the chain, so paged calls, which drop the chain, keep it (main
+  lost it on chained shapes). GB300 (152 SMs), CUDA graphs, fwd+bwd us, main → this change: GDN
+  1x16384 H12 2071→876, H4 2039→795, H48 1744→1740 (same plan, bitwise); 1x8192 H24 1104→702;
+  1x4096 H12 568→507, H48 641→619; 1x32768 H12 1461→1211; KDA 1x4096 H24 1277→1184, 1x32768 H24
+  4149→4053. Paged forward GDN 1x24576 H48 672→547 (bitwise). Rel L2 vs fp32 unchanged or lower
+  except a never-forgetting gate (dgate 5.1e-3 → 5.5e-3). Bench gate (`--suite gdn kda summary paged`) vs
+  17e5df8 on GB300: PASS, every cell 0.993-1.005, launch sets identical, outputs unchanged.
 - **F7/F8 — native CP summaries** `[B;A]` and reverse maps `[C;R]` for arbitrary bounds via a
   device-selected uncut work table (graph-safe Triton selector). 0.43–0.55× of main (T16384 B4 H16
   fwd 536→289 µs, rev 1439→647). KS::test_native_selected_bounds.
