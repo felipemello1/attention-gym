@@ -7,6 +7,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode
+from attn_gym.linear._delta_rule import decode as decode_module
 from attn_gym.linear._delta_rule.decode import _decode_launch_config
 from attn_gym.linear._delta_rule.recurrent import GateKind
 from attn_gym.linear.gdn.ops import recurrent_decode_op
@@ -226,6 +227,32 @@ def test_decode_padding_and_fresh_slots():
     torch.testing.assert_close(
         inputs["state_cache"][preserved], original_pool[preserved], rtol=0, atol=0
     )
+
+
+def test_decode_capped_grid_loops_over_padded_rows(monkeypatch):
+    """A grid smaller than the work loops over it; null rows interleaved with active ones."""
+    # 64 rows x 4 heads x 8 V tiles = 2048 items on 512 programs, 4 items each
+    monkeypatch.setattr(decode_module, "_MAX_PROGRAMS_PER_SM", 1)
+    batch = 64
+    inputs = make_decode_inputs(batch=batch, key_dim=128, value_dim=128, num_slots=batch + 1)
+    slots = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    slots[::3] = 0
+    inputs["state_indices"] = slots
+    expected_output, expected_pool = reference_decode(inputs)
+
+    output = recurrent_gdn_decode(
+        inputs["packed_qkv"],
+        inputs["raw_gate"],
+        inputs["raw_beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["state_cache"],
+        inputs["state_indices"],
+    )
+
+    assert output[0, ::3].eq(0).all()
+    torch.testing.assert_close(output[0].float(), expected_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(inputs["state_cache"], expected_pool, rtol=1e-5, atol=1e-5)
 
 
 def test_decode_out_buffer_contract():

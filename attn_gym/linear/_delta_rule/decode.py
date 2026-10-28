@@ -73,9 +73,17 @@ def _decode_launch_config(
     return min(triton.next_power_of_2(value_dim), block_v), num_warps
 
 
-# Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
-# (batch row, value head, V tile), processes all K channels for that tile, and gets
-# contiguous K-dimension accesses from the [V, K] state layout.
+# Work items are (batch row, value head, V tile), B * H * ceil(V / BV) of them on a flat 1D
+# grid. Each item processes all K channels for its tile, and gets contiguous K-dimension
+# accesses from the [V, K] state layout. The grid is capped at _MAX_PROGRAMS_PER_SM programs
+# per SM and loops over the items: serving pads the batch with null rows (CUDA graph buckets,
+# packed steps), and a null item costs one slot load and a zero store, not a launched program.
+# Programs keep at most _MAX_ITEMS_PER_PROGRAM items: their items are fixed at launch, so on
+# large active batches long programs finish unevenly.
+_MAX_PROGRAMS_PER_SM = 256
+_MAX_ITEMS_PER_PROGRAM = 4
+
+
 @triton.jit
 def _recurrent_delta_rule_decode_kernel(
     packed_qkv,
@@ -89,6 +97,7 @@ def _recurrent_delta_rule_decode_kernel(
     has_initial_state,
     lower_bound,
     scale,
+    num_items,
     state_batch_stride: tl.constexpr,
     qkv_token_stride: tl.constexpr,
     gate_token_stride: tl.constexpr,
@@ -103,84 +112,90 @@ def _recurrent_delta_rule_decode_kernel(
     SCALAR_GATE: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
-    i_v = pid % NV
-    i_nh = pid // NV
-    i_n, i_h = i_nh // H, i_nh % H
-    i_hk = i_h // (H // HK)
-
     o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
     m_k = o_k < K
-    m_v = o_v < V
-    m_vk = m_v[:, None] & m_k[None, :]
+    for pid in tl.range(tl.program_id(0), num_items, tl.num_programs(0)):
+        pid = pid.to(tl.int64)
+        i_v = pid % NV
+        i_nh = pid // NV
+        i_n, i_h = i_nh // H, i_nh % H
+        i_hk = i_h // (H // HK)
 
-    state_slot, state_active, load_initial = resolve_paged_state(
-        i_n,
-        state_indices,
-        has_initial_state,
-        True,
-        USE_HAS_INITIAL_STATE,
-    )
-    row = i_n * H + i_h
-    if not state_active:
-        tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
-        return
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = o_v < V
+        m_vk = m_v[:, None] & m_k[None, :]
 
-    p_state = ptr_offset(
-        (state_slot, i_h, o_v[:, None], o_k[None, :]),
-        (state_batch_stride, V * K, K, 1),
-    )
-    b_state = tl.load(state_cache + p_state, mask=m_vk & load_initial, other=0.0).to(tl.float32)
-
-    p_qkv = packed_qkv + i_n * qkv_token_stride
-    b_q = tl.load(p_qkv + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
-    b_k = tl.load(p_qkv + HK * K + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(
-        tl.float32
-    )
-    b_v = tl.load(p_qkv + 2 * HK * K + ptr_offset((i_h, o_v), (V, 1)), mask=m_v, other=0.0).to(
-        tl.float32
-    )
-    b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
-    b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
-
-    if SCALAR_GATE:
-        b_gate_input = tl.load(raw_gate + i_n * gate_token_stride + i_h).to(tl.float32)
-        b_gate_input += tl.load(dt_bias + i_h).to(tl.float32)
-    else:
-        # The gate decays each value head's own state; only q/k are shared across a group.
-        p_gate = raw_gate + i_n * gate_token_stride + ptr_offset((i_h, o_k), (K, 1))
-        b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
-        b_gate_input += tl.load(dt_bias + ptr_offset((i_h, o_k), (K, 1)), mask=m_k, other=0.0).to(
-            tl.float32
+        state_slot, state_active, load_initial = resolve_paged_state(
+            i_n,
+            state_indices,
+            has_initial_state,
+            True,
+            USE_HAS_INITIAL_STATE,
         )
-    b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
-    if USE_LOWER_BOUND:
-        b_gate = lower_bound * tl.sigmoid(b_a * b_gate_input)
-    else:
-        b_softplus = tl.where(
-            b_gate_input > 20.0,
-            b_gate_input,
-            tl.where(
-                b_gate_input < -10.0,
-                tl.exp(b_gate_input),
-                tl.log(1.0 + tl.exp(b_gate_input)),
-            ),
-        )
-        b_gate = -b_a * b_softplus
+        row = i_n * H + i_h
+        if not state_active:
+            tl.store(output + ptr_offset((row, o_v), (V, 1)), 0.0, mask=m_v)
+        else:
+            p_state = ptr_offset(
+                (state_slot, i_h, o_v[:, None], o_k[None, :]),
+                (state_batch_stride, V * K, K, 1),
+            )
+            b_state = tl.load(state_cache + p_state, mask=m_vk & load_initial, other=0.0).to(
+                tl.float32
+            )
 
-    if SCALAR_GATE:
-        b_state *= tl.exp(b_gate)
-    else:
-        b_state *= tl.exp(b_gate)[None, :]
-    b_delta = b_v - tl.sum(b_state * b_k[None, :], axis=1)
-    b_beta = tl.sigmoid(tl.load(raw_beta + i_n * beta_token_stride + i_h).to(tl.float32))
-    b_delta *= b_beta
-    b_state += b_delta[:, None] * b_k[None, :]
-    b_o = tl.sum(b_state * b_q[None, :], axis=1)
-    tl.store(output + ptr_offset((row, o_v), (V, 1)), b_o.to(output.dtype.element_ty), mask=m_v)
-    tl.store(state_cache + p_state, b_state, mask=m_vk)
+            p_qkv = packed_qkv + i_n * qkv_token_stride
+            b_q = tl.load(p_qkv + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0).to(
+                tl.float32
+            )
+            b_k = tl.load(
+                p_qkv + HK * K + ptr_offset((i_hk, o_k), (K, 1)), mask=m_k, other=0.0
+            ).to(tl.float32)
+            b_v = tl.load(
+                p_qkv + 2 * HK * K + ptr_offset((i_h, o_v), (V, 1)), mask=m_v, other=0.0
+            ).to(tl.float32)
+            b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
+            b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+
+            if SCALAR_GATE:
+                b_gate_input = tl.load(raw_gate + i_n * gate_token_stride + i_h).to(tl.float32)
+                b_gate_input += tl.load(dt_bias + i_h).to(tl.float32)
+            else:
+                # The gate decays each value head's own state; only q/k are shared across a group.
+                p_gate = raw_gate + i_n * gate_token_stride + ptr_offset((i_h, o_k), (K, 1))
+                b_gate_input = tl.load(p_gate, mask=m_k, other=0.0).to(tl.float32)
+                b_gate_input += tl.load(
+                    dt_bias + ptr_offset((i_h, o_k), (K, 1)), mask=m_k, other=0.0
+                ).to(tl.float32)
+            b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+            if USE_LOWER_BOUND:
+                b_gate = lower_bound * tl.sigmoid(b_a * b_gate_input)
+            else:
+                b_softplus = tl.where(
+                    b_gate_input > 20.0,
+                    b_gate_input,
+                    tl.where(
+                        b_gate_input < -10.0,
+                        tl.exp(b_gate_input),
+                        tl.log(1.0 + tl.exp(b_gate_input)),
+                    ),
+                )
+                b_gate = -b_a * b_softplus
+
+            if SCALAR_GATE:
+                b_state *= tl.exp(b_gate)
+            else:
+                b_state *= tl.exp(b_gate)[None, :]
+            b_delta = b_v - tl.sum(b_state * b_k[None, :], axis=1)
+            b_beta = tl.sigmoid(tl.load(raw_beta + i_n * beta_token_stride + i_h).to(tl.float32))
+            b_delta *= b_beta
+            b_state += b_delta[:, None] * b_k[None, :]
+            b_o = tl.sum(b_state * b_q[None, :], axis=1)
+            tl.store(
+                output + ptr_offset((row, o_v), (V, 1)), b_o.to(output.dtype.element_ty), mask=m_v
+            )
+            tl.store(state_cache + p_state, b_state, mask=m_vk)
 
 
 def launch_recurrent_delta_rule_decode(
@@ -257,7 +272,12 @@ def launch_recurrent_delta_rule_decode(
         tuned_major,
         gate_kind,
     )
-    grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
+    num_items = triton.cdiv(value_dim, block_v) * batch * heads
+    max_programs = max(
+        get_device_properties(packed_qkv.device).multi_processor_count * _MAX_PROGRAMS_PER_SM,
+        triton.cdiv(num_items, _MAX_ITEMS_PER_PROGRAM),
+    )
+    grid = (min(num_items, max_programs),)
     _recurrent_delta_rule_decode_kernel[grid](
         packed_qkv,
         raw_gate,
@@ -270,6 +290,7 @@ def launch_recurrent_delta_rule_decode(
         has_initial_state,
         lower_bound,
         scale=scale,
+        num_items=num_items,
         state_batch_stride=state_cache.stride(0),
         qkv_token_stride=packed_qkv.stride(0),
         gate_token_stride=raw_gate.stride(0),
