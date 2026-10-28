@@ -120,7 +120,8 @@ implementation choices fail rather than falling back to the reference.
 beta projections, computes the gate transform (`-exp(A_log) * softplus(raw + dt_bias)`), the
 beta sigmoid, and the query/key L2 normalization in-kernel, supports grouped q/k heads, and
 advances the paged FP32 state pool in place through `state_indices`, so no separate
-elementwise kernels run per decode step.
+elementwise kernels run per decode step. `A_log` and `dt_bias` may be FP32, BF16 or FP16: the
+kernel upcasts them, so callers need no cast either.
 
 ::: attn_gym.linear.chunk_gdn
 
@@ -206,7 +207,7 @@ public boundary. The complete fused KDA variant currently requires Hopper becaus
 chunk boundaries are not caller-visible representations.
 
 The example explicitly runs projections in BF16 while retaining FP32 parameters and gate
-math; no ambient autocast context is required. Distributed mixed-precision policies must
+math; no ambient autocast context is required. Distributed mixed-precision training policies must
 preserve `A_log` and `dt_bias` as FP32 when parameters are materialized, rather than only
 casting activations inside `forward`. A module-wide BF16 FSDP policy violates that
 contract. A correctness-first integration can keep the KDA unit under an FP32 policy while

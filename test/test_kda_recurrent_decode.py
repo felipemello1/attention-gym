@@ -323,6 +323,22 @@ def test_recurrent_decode_softplus_matches_negative_tail_reference():
     torch.testing.assert_close(state_cache, expected_cache, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
+def test_recurrent_decode_half_gate_params_match_fp32_copies(param_dtype: torch.dtype):
+    """The kernel upcasts A_log/dt_bias, so 16-bit values give the same bits as FP32 copies."""
+    inputs = _decode_inputs()
+    packed_qkv, raw_gate, raw_beta, A_log, dt_bias, _, state_cache, state_indices = inputs
+    A_log, dt_bias = A_log.to(param_dtype), dt_bias.to(param_dtype)
+    results = []
+    for gate_params in ((A_log, dt_bias), (A_log.float(), dt_bias.float())):
+        cache = state_cache.clone()
+        output = recurrent_kda_decode(
+            packed_qkv, raw_gate, raw_beta, *gate_params, cache, state_indices
+        )
+        results.append((output, cache))
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+
 def test_recurrent_decode_padding_slots_are_ignored():
     inputs = list(_decode_inputs())
     inputs[-1] = torch.tensor([5, 0, -1], device="cuda", dtype=torch.int32)
@@ -409,10 +425,12 @@ def test_recurrent_decode_validates_contract():
             lower_bound=1.0,
         )
     for name, invalid_A_log, invalid_dt_bias in (
-        ("A_log", A_log.bfloat16(), dt_bias),
-        ("dt_bias", A_log, dt_bias.bfloat16()),
+        ("A_log", A_log.double(), dt_bias),
+        ("dt_bias", A_log, dt_bias.double()),
     ):
-        with pytest.raises(ValueError, match=rf"{name} must be contiguous float32"):
+        with pytest.raises(
+            ValueError, match=rf"{name} must be contiguous float32, bfloat16 or float16"
+        ):
             recurrent_kda_decode(
                 packed_qkv,
                 raw_gate,

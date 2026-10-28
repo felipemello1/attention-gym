@@ -331,8 +331,10 @@ def recurrent_gdn_decode(
         raw_gate: Unactivated per-head gate projection shaped ``[1, B, H]``, matching the
             vLLM-style single-token decode convention used by ``recurrent_kda_decode``.
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
-        A_log: FP32 per-head log decay parameter shaped ``[H]``.
-        dt_bias: FP32 per-head gate bias shaped ``[H]``.
+        A_log: FP32, BF16 or FP16 per-head log decay parameter shaped ``[H]``, upcast to FP32
+            in the kernel.
+        dt_bias: FP32, BF16 or FP16 per-head gate bias shaped ``[H]``, upcast to FP32 in the
+            kernel.
         state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
             Slots may have padding between them but each ``[H, V, K]`` row must be dense.
             Recurrence math remains FP32 and the updated state is cast to the pool dtype.
@@ -381,8 +383,14 @@ def recurrent_gdn_decode(
     for name, tensor in (("raw_gate", raw_gate), ("raw_beta", raw_beta)):
         if tensor.shape != (1, batch, heads) or tensor.stride(2) != 1:
             raise ValueError(f"{name} must have shape {(1, batch, heads)} with contiguous heads")
-    if dt_bias.shape != (heads,) or dt_bias.dtype != torch.float32 or not dt_bias.is_contiguous():
-        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads},)")
+    if (
+        dt_bias.shape != (heads,)
+        or dt_bias.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+        or not dt_bias.is_contiguous()
+    ):
+        raise ValueError(
+            f"dt_bias must be contiguous float32, bfloat16 or float16 with shape ({heads},)"
+        )
 
     scale = resolve_scale(scale, key_dim)
 

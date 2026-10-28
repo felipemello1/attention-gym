@@ -509,8 +509,10 @@ def recurrent_kda_decode(
             within each section, head rows are contiguous.
         raw_gate: Unactivated gate shaped ``[1, B, H, K]``.
         raw_beta: Unactivated write gate shaped ``[1, B, H]``.
-        A_log: FP32 per-head log decay parameter shaped ``[H]``.
-        dt_bias: FP32 per-head/channel gate bias shaped ``[H, K]``.
+        A_log: FP32, BF16 or FP16 per-head log decay parameter shaped ``[H]``, upcast to FP32
+            in the kernel.
+        dt_bias: FP32, BF16 or FP16 per-head/channel gate bias shaped ``[H, K]``, upcast to FP32
+            in the kernel.
         state_cache: FP32 or BF16 paged state pool shaped ``[num_slots, H, V, K]``.
             Slots may have padding between them but each ``[H, V, K]`` row must be dense.
             Recurrence math remains FP32 and the updated state is cast to the pool dtype.
@@ -568,10 +570,13 @@ def recurrent_kda_decode(
         raise ValueError(f"raw_beta must have shape {(1, batch, heads)} with contiguous heads")
     if (
         dt_bias.shape != (heads, key_dim)
-        or dt_bias.dtype != torch.float32
+        or dt_bias.dtype not in (torch.float32, torch.bfloat16, torch.float16)
         or not dt_bias.is_contiguous()
     ):
-        raise ValueError(f"dt_bias must be contiguous float32 with shape ({heads}, {key_dim})")
+        raise ValueError(
+            f"dt_bias must be contiguous float32, bfloat16 or float16 with shape "
+            f"({heads}, {key_dim})"
+        )
 
     use_lower_bound = _resolve_decode_gate_transform(gate_transform)
     if use_lower_bound:

@@ -258,6 +258,26 @@ def test_decode_out_buffer_contract():
         )
 
 
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float16])
+def test_decode_half_gate_params_match_fp32_copies(param_dtype: torch.dtype):
+    """The kernel upcasts A_log/dt_bias, so 16-bit values give the same bits as FP32 copies."""
+    inputs = make_decode_inputs(dtype=torch.bfloat16)
+    A_log, dt_bias = inputs["A_log"].to(param_dtype), inputs["dt_bias"].to(param_dtype)
+    results = []
+    for gate_params in ((A_log, dt_bias), (A_log.float(), dt_bias.float())):
+        state_cache = inputs["state_cache"].clone()
+        output = recurrent_gdn_decode(
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            *gate_params,
+            state_cache,
+            inputs["state_indices"],
+        )
+        results.append((output, state_cache))
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+
 def test_decode_rejects_bad_inputs():
     inputs = make_decode_inputs()
     with pytest.raises(ValueError, match="positive divisor"):
@@ -267,6 +287,18 @@ def test_decode_rejects_bad_inputs():
             inputs["raw_beta"],
             inputs["A_log"],
             inputs["dt_bias"],
+            inputs["state_cache"],
+            inputs["state_indices"],
+        )
+    with pytest.raises(
+        ValueError, match="dt_bias must be contiguous float32, bfloat16 or float16"
+    ):
+        recurrent_gdn_decode(
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            inputs["A_log"],
+            inputs["dt_bias"].double(),
             inputs["state_cache"],
             inputs["state_indices"],
         )
