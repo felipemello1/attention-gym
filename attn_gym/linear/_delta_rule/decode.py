@@ -210,8 +210,8 @@ def launch_recurrent_delta_rule_decode(
             ``GateKind.SCALAR`` or ``[B, H, K]`` for ``GateKind.VECTOR``.
         raw_beta: Unactivated token-major write gate shaped ``[B, H]``, activated in-kernel
             as ``sigmoid``.
-        A_log: FP32 per-head log decay parameter shaped ``[H]``.
-        dt_bias: FP32 gate bias, ``[H]`` for scalar or ``[H, K]`` for vector gates.
+        A_log: FP32, BF16 or FP16 per-head log decay parameter shaped ``[H]``.
+        dt_bias: FP32, BF16 or FP16 gate bias, ``[H]`` for scalar or ``[H, K]`` for vector gates.
         state_cache: Mutable FP32 or BF16 pool shaped ``[num_slots, H, V, K]``; selected slots
             are advanced in place using FP32 recurrence math. Slots may have padding between
             them but each ``[H, V, K]`` row must be dense.
