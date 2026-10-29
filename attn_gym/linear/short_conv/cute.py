@@ -137,6 +137,40 @@ def sequence_bounds(cu_seqlens: cute.Tensor, time: Int32):
 
 
 @cute.jit
+def warp_sequence_bounds(cu_seqlens: cute.Tensor, time: Int32):
+    """Find the packed sequence containing ``time`` with a 32-way search across the warp.
+
+    Every lane of the warp must call it with the same ``time``. Each round probes 32 offsets
+    at once, so up to 1024 offsets take two dependent loads, where a binary search over a
+    padded capacity of 257 sequences takes nine.
+    """
+    num_offsets = Int32(cute.size(cu_seqlens))
+    low = Int32(1)
+    high = num_offsets
+    while low < high:  # the first offset past ``time`` lies in [low, high]
+        stride = (high - low + 31) // 32
+        probe = low + cute.arch.lane_idx() * stride
+        reached = cutlass.Boolean(False)
+        if probe < high:
+            reached = Int32(cu_seqlens[probe]) <= time
+        count = cute.arch.popc(cute.arch.vote_ballot_sync(reached))
+        if count == 0:
+            high = low
+        else:
+            last = low + (count - 1) * stride
+            low = last + 1
+            high = cutlass.min(high, last + stride)
+    sequence = low - 1
+    if sequence >= num_offsets - 1:
+        sequence = num_offsets - 2
+    sequence_start = Int32(cu_seqlens[sequence])
+    sequence_end = Int32(cu_seqlens[sequence + 1])
+    if sequence_start < 0:
+        sequence_start = Int32(0)
+    return sequence, sequence_start, sequence_end
+
+
+@cute.jit
 def tile_sequence_bounds(
     cu_seqlens: cute.Tensor | None,
     time: Int32,
@@ -232,40 +266,6 @@ def load_history(
 
 
 @cute.jit
-def load_paged_history(
-    state: cute.Tensor,
-    state_indices: cute.Tensor,
-    has_initial_state: cute.Tensor | None,
-    sequence: Int32,
-    input_time: Int32,
-    sequence_start: Int32,
-    channel_group: Int32,
-    channels_per_thread: cutlass.Constexpr,
-    width: cutlass.Constexpr,
-):
-    """Load selected paged history, using zeros for null and fresh slots."""
-    values = cute.make_rmem_tensor((channels_per_thread,), Float32)
-    values.fill(Float32(0.0))
-    slot = state_indices[sequence]
-    if slot > 0:
-        state_offset = width - 1 + input_time - sequence_start
-        state_groups = cute.zipped_divide(state, (1, 1, channels_per_thread))
-        if cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
-            values.store(
-                state_groups[((0, 0, None), (slot, state_offset, channel_group))]
-                .load()
-                .to(Float32)
-            )
-        elif has_initial_state[sequence]:
-            values.store(
-                state_groups[((0, 0, None), (slot, state_offset, channel_group))]
-                .load()
-                .to(Float32)
-            )
-    return values.load()
-
-
-@cute.jit
 def history_dot(
     inputs: cute.Tensor,
     weights: cute.Tensor,
@@ -277,37 +277,17 @@ def history_dot(
     channel_group: Int32,
     channels_per_thread: cutlass.Constexpr,
     width: cutlass.Constexpr,
-    state_indices: cute.Tensor | None = None,
-    has_initial_state: cute.Tensor | None = None,
 ):
-    """Evaluate an early convolution dot product from staged input and history.
-
-    ``state`` is compact channel-grouped history, or a paged pool when ``state_indices``
-    is given.
-    """
+    """Evaluate an early convolution dot product from staged input and compact history."""
     taps = cute.make_rmem_tensor((channels_per_thread, width), Float32)
     for tap in cutlass.range_constexpr(width):
         input_time = output_time + tap - (width - 1)
         input_value = cute.make_rmem_tensor((channels_per_thread,), Float32)
         if input_time >= sequence_start:
             input_value.store(inputs[(None, input_offset + tap)].load().to(Float32))
-        elif cutlass.const_expr(state_indices is None):
-            input_value.store(
-                load_history(state, sequence, input_time, sequence_start, channel_group, width)
-            )
         else:
             input_value.store(
-                load_paged_history(
-                    state,
-                    state_indices,
-                    has_initial_state,
-                    sequence,
-                    input_time,
-                    sequence_start,
-                    channel_group,
-                    channels_per_thread,
-                    width,
-                )
+                load_history(state, sequence, input_time, sequence_start, channel_group, width)
             )
         taps[(None, tap)].store(input_value.load())
     # Sum in the same order as in-sequence windows and decode (newest tap first).
@@ -444,8 +424,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
         output: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
-        state_indices: cute.Tensor | None,
-        has_initial_state: cute.Tensor | None,
         full_tile: cutlass.Constexpr,
         active_endpoint: Int32,
         tokens: Int32,
@@ -453,7 +431,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
         """Compute the physical time tile owned by this CTA."""
         thread_idx, _, _ = cute.arch.thread_idx()
         time_block, channel_block, batch = cute.arch.block_idx()
-        if cutlass.const_expr(cu_seqlens is not None and state_indices is None):
+        if cutlass.const_expr(cu_seqlens is not None):
             batch = Int32(0)
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
@@ -464,7 +442,7 @@ class CausalConv1dSiluForward(ShortConvKernel):
             weights = self.load_weights(weight, channel)
             output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
             initial_groups = initial_state
-            if cutlass.const_expr(initial_state is not None and state_indices is None):
+            if cutlass.const_expr(initial_state is not None):
                 initial_groups = cute.zipped_divide(initial_state, (1, self.channels_per_thread))
             inputs = cute.make_rmem_tensor(
                 (self.channels_per_thread, self.times_per_block + self.width - 1),
@@ -517,8 +495,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                                 channel_group,
                                 self.channels_per_thread,
                                 self.width,
-                                state_indices,
-                                has_initial_state,
                             )
                     elif cutlass.const_expr(cu_seqlens is None):
                         value = unrolled_dot(inputs, weights, time_offset, self.width)
@@ -540,13 +516,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                                         * weights[(None, tap)].load()
                                     )
                     value = self.activation(value).to(self.dtype.cute_type)
-                    if cutlass.const_expr(state_indices is not None):  # noqa: SIM102
-                        if state_indices[sequence] <= 0:
-                            padding = cute.make_rmem_tensor(
-                                (self.channels_per_thread,), self.dtype.cute_type
-                            )
-                            padding.fill(self.dtype.cute_type(0.0))
-                            value = padding.load()
                     self.row_group(output_groups, batch, time, tokens, channel_group).store(value)
 
     @cute.kernel
@@ -557,8 +526,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
         output: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         initial_state: cute.Tensor | None,
-        state_indices: cute.Tensor | None,
-        has_initial_state: cute.Tensor | None,
         tokens: Int32,
     ):
         """Dispatch one capacity tile using the runtime packed endpoint."""
@@ -574,8 +541,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                 output,
                 cu_seqlens,
                 initial_state,
-                state_indices,
-                has_initial_state,
                 True,
                 active_endpoint,
                 tokens,
@@ -589,8 +554,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     output,
                     cu_seqlens,
                     initial_state,
-                    state_indices,
-                    has_initial_state,
                     True,
                     active_endpoint,
                     tokens,
@@ -602,8 +565,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
                     output,
                     cu_seqlens,
                     initial_state,
-                    state_indices,
-                    has_initial_state,
                     False,
                     active_endpoint,
                     tokens,
@@ -628,8 +589,6 @@ class CausalConv1dSiluForward(ShortConvKernel):
             output,
             cu_seqlens,
             initial_state,
-            None,
-            None,
             tokens,
         ).launch(
             grid=self.launch_grid(
@@ -640,10 +599,260 @@ class CausalConv1dSiluForward(ShortConvKernel):
         )
 
 
-class CausalConv1dPagedForward(CausalConv1dSiluForward):
-    """Launch forward with direct paged-history addressing."""
+# NOTE [Paged forward heads]
+# A sequence's first W - 1 outputs read its paged history. One CTA per sequence (the first
+# grid.x blocks) computes them and then writes the sequence's final history, as vLLM's
+# per-sequence programs do; the remaining blocks each own one time tile and write every other
+# output. A tile therefore never loads history, and a one-token sequence costs one head CTA
+# instead of a serial lookup inside some tile. The grid depends only on the token capacity and
+# the sequence-vector length, so CUDA Graph replays can change the offsets and routes.
+
+
+class CausalConv1dPagedForward(ShortConvKernel):
+    """Convolve paged prefill and advance each selected history slot in one launch."""
 
     kernel_kind = "paged_fwd"
+
+    def __init__(
+        self,
+        channels: int,
+        width: int,
+        config: ShortConvConfig,
+        dtype: ShortConvDType,
+        activation,
+        use_int64_offsets: bool = False,
+    ):
+        super().__init__(channels, width, config, dtype, use_int64_offsets)
+        self.activation = activation
+
+    @cute.jit
+    def run_head(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        state: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_state: cute.Tensor | None,
+        sequence: Int32,
+        tokens: Int32,
+    ):
+        """Write one sequence's history-reading outputs and its final history."""
+        thread_idx, _, _ = cute.arch.thread_idx()
+        _, channel_block, _ = cute.arch.block_idx()
+        channel_group = channel_block * self.threads + thread_idx
+        channel = channel_group * self.channels_per_thread
+        batch = Int32(sequence)
+        sequence_start = Int32(0)
+        sequence_end = tokens
+        if cutlass.const_expr(cu_seqlens is not None):
+            batch = Int32(0)
+            sequence_start = Int32(cu_seqlens[sequence])
+            sequence_end = Int32(cu_seqlens[sequence + 1])
+        resumed = cutlass.Boolean(True)
+        if cutlass.const_expr(has_initial_state is not None):
+            resumed = cutlass.Boolean(has_initial_state[sequence])
+        slot = state_indices[sequence]
+        if channel < self.channels and slot > 0:
+            sequence_length = sequence_end - sequence_start
+            state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
+            output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
+            weights = self.load_weights(weight, channel)
+            # The W - 1 history rows, then the sequence's first W - 1 inputs.
+            window = cute.make_rmem_tensor(
+                (self.channels_per_thread, 2 * (self.width - 1)), self.dtype.cute_type
+            )
+            window.fill(self.dtype.cute_type(0.0))
+            if resumed:  # fresh slots may contain NaNs: never load their old history
+                for row in cutlass.range_constexpr(self.width - 1):
+                    window[(None, row)].store(
+                        state_groups[((0, 0, None), (slot, row, channel_group))].load()
+                    )
+            for offset in cutlass.range_constexpr(self.width - 1):
+                if offset < sequence_length:
+                    window[(None, self.width - 1 + offset)].store(
+                        self.input_group(x, batch, sequence_start + offset, channel_group).load()
+                    )
+            # The final history, loaded before any store: the last W - 1 inputs, or for a
+            # short sequence window[row + sequence_length].
+            final_history = cute.make_rmem_tensor(
+                (self.channels_per_thread, self.width - 1), self.dtype.cute_type
+            )
+            final_history.fill(self.dtype.cute_type(0.0))
+            for row in cutlass.range_constexpr(self.width - 1):
+                input_time = sequence_end - (self.width - 1) + row
+                if input_time >= sequence_start:
+                    final_history[(None, row)].store(
+                        self.input_group(x, batch, input_time, channel_group).load()
+                    )
+                else:
+                    for source in cutlass.range_constexpr(self.width - 1):
+                        if source == row + sequence_length:
+                            final_history[(None, row)].store(window[(None, source)].load())
+
+            for offset in cutlass.range_constexpr(self.width - 1):
+                if offset < sequence_length:
+                    # Decode's explicit FMA order, so a one-token sequence matches it bitwise.
+                    value = unrolled_dot(window, weights, offset, self.width, explicit_fma=True)
+                    self.row_group(
+                        output_groups, batch, sequence_start + offset, tokens, channel_group
+                    ).store(self.activation(value).to(self.dtype.cute_type))
+            for row in cutlass.range_constexpr(self.width - 1):
+                state_groups[((0, 0, None), (slot, row, channel_group))].store(
+                    final_history[(None, row)].load()
+                )
+
+    @cute.jit
+    def run_tile(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        state_indices: cute.Tensor,
+        time_block: Int32,
+        full_tile: cutlass.Constexpr,
+        active_endpoint: Int32,
+        tokens: Int32,
+    ):
+        """Write a time tile's outputs except the ones its sequences' heads own."""
+        thread_idx, _, _ = cute.arch.thread_idx()
+        _, channel_block, batch = cute.arch.block_idx()
+        channel_group = channel_block * self.threads + thread_idx
+        channel = channel_group * self.channels_per_thread
+        time_start = time_block * self.times_per_block
+
+        sequence = Int32(batch)
+        if cutlass.const_expr(cu_seqlens is not None):
+            batch = Int32(0)
+        # Issue the input loads first; the token classification below overlaps their latency.
+        weights = cute.make_rmem_tensor((self.channels_per_thread, self.width), Float32)
+        inputs = cute.make_rmem_tensor(
+            (self.channels_per_thread, self.times_per_block + self.width - 1),
+            self.dtype.cute_type,
+        )
+        inputs.fill(self.dtype.cute_type(0.0))
+        if channel < self.channels:
+            weights.store(self.load_weights(weight, channel).load())
+            for input_offset in cutlass.range_constexpr(self.times_per_block + self.width - 1):
+                input_time = time_start + input_offset - (self.width - 1)
+                if input_time >= 0 and (
+                    cutlass.const_expr(full_tile) or input_time < active_endpoint
+                ):
+                    inputs[(None, input_offset)].store(
+                        self.input_group(x, batch, input_time, channel_group).load()
+                    )
+
+        # Every lane classifies every token outside the channel guard: the warp votes need them.
+        sequence_start = Int32(0)
+        sequence_end = tokens
+        next_start = Int32(2**31 - 1)
+        next_slot = Int32(0)
+        if cutlass.const_expr(cu_seqlens is not None):
+            sequence, sequence_start, sequence_end = warp_sequence_bounds(cu_seqlens, time_start)
+            if sequence_end < time_start + self.times_per_block:
+                # Lane i holds the start and slot of the i-th sequence after the tile's first.
+                next_sequence = sequence + 1 + cute.arch.lane_idx()
+                if next_sequence < cute.size(cu_seqlens) - 1:
+                    next_start = Int32(cu_seqlens[next_sequence])
+                    next_slot = Int32(state_indices[next_sequence])
+        slot = Int32(state_indices[sequence])
+        head_tokens = Int32(0)
+        null_tokens = Int32(0)
+        for time_offset in cutlass.range_constexpr(self.times_per_block):
+            time = time_start + time_offset
+            token_start = sequence_start
+            token_slot = slot
+            if cutlass.const_expr(cu_seqlens is not None):  # noqa: SIM102
+                if time >= sequence_end and time < active_endpoint:
+                    started = cute.arch.popc(cute.arch.vote_ballot_sync(next_start <= time))
+                    if started == 32:  # over 31 boundaries (empty sequences): search
+                        token_sequence, token_start, _ = warp_sequence_bounds(cu_seqlens, time)
+                        token_slot = Int32(state_indices[token_sequence])
+                    else:
+                        token_start = cute.arch.shuffle_sync(next_start, started - 1)
+                        token_slot = cute.arch.shuffle_sync(next_slot, started - 1)
+            if time - token_start < self.width - 1:
+                head_tokens = head_tokens | (1 << time_offset)
+            if token_slot <= 0:
+                null_tokens = null_tokens | (1 << time_offset)
+
+        if channel < self.channels:
+            output_groups = cute.zipped_divide(output, (1, self.channels_per_thread))
+            for time_offset in cutlass.range_constexpr(self.times_per_block):
+                time = time_start + time_offset
+                if cutlass.const_expr(full_tile) or time < active_endpoint:
+                    row = self.row_group(output_groups, batch, time, tokens, channel_group)
+                    if (null_tokens >> time_offset) & 1 != 0:
+                        padding = cute.make_rmem_tensor(
+                            (self.channels_per_thread,), self.dtype.cute_type
+                        )
+                        padding.fill(self.dtype.cute_type(0.0))
+                        row.store(padding.load())
+                    elif (head_tokens >> time_offset) & 1 == 0:
+                        value = unrolled_dot(inputs, weights, time_offset, self.width)
+                        row.store(self.activation(value).to(self.dtype.cute_type))
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        cu_seqlens: cute.Tensor | None,
+        state: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_state: cute.Tensor | None,
+        tokens: Int32,
+    ):
+        """Dispatch a sequence head or one capacity tile; see NOTE [Paged forward heads]."""
+        block, _, batch = cute.arch.block_idx()
+        heads = Int32(1)
+        active_endpoint = Int32(tokens)
+        if cutlass.const_expr(cu_seqlens is not None):
+            heads = Int32(cute.size(state_indices))
+            active_endpoint = load_ragged_token_count(cu_seqlens)
+        if block < heads:
+            self.run_head(
+                x,
+                weight,
+                output,
+                cu_seqlens,
+                state,
+                state_indices,
+                has_initial_state,
+                block + batch,
+                tokens,
+            )
+        else:
+            time_block = block - heads
+            time_start = time_block * self.times_per_block
+            # Subtraction avoids overflowing the last physical tile's upper edge.
+            if active_endpoint - time_start >= self.times_per_block:
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    state_indices,
+                    time_block,
+                    True,
+                    active_endpoint,
+                    tokens,
+                )
+            elif time_start < active_endpoint:
+                self.run_tile(
+                    x,
+                    weight,
+                    output,
+                    cu_seqlens,
+                    state_indices,
+                    time_block,
+                    False,
+                    active_endpoint,
+                    tokens,
+                )
 
     @cute.jit
     def __call__(
@@ -658,8 +867,11 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
         tokens: Int32,
         stream,
     ):
-        """Launch the mutable-history forward specialization."""
+        """Launch heads and time tiles of the mutable-history forward together."""
         self.kernel.set_name_prefix(self.get_name())
+        heads = 1
+        if cutlass.const_expr(cu_seqlens is not None):
+            heads = cute.size(state_indices)
         self.kernel(
             x,
             weight,
@@ -671,7 +883,9 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
             tokens,
         ).launch(
             grid=self.launch_grid(
-                cute.ceil_div(tokens, self.times_per_block), cute.size(state_indices), cu_seqlens
+                heads + cute.ceil_div(tokens, self.times_per_block),
+                cute.size(state_indices),
+                cu_seqlens,
             ),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -786,90 +1000,6 @@ class CausalConv1dSiluDecode(ShortConvKernel):
             grid=(
                 cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
                 cute.size(x, mode=[0]),
-                1,
-            ),
-            block=(self.threads, 1, 1),
-            stream=stream,
-        )
-
-
-class CausalConv1dPagedStateUpdate(ShortConvKernel):
-    """Write each sequence's final causal history directly into its selected slot."""
-
-    kernel_kind = "paged_state"
-    time_tiled = False
-
-    @cute.kernel
-    def kernel(
-        self,
-        x: cute.Tensor,
-        state: cute.Tensor,
-        state_indices: cute.Tensor,
-        has_initial_state: cute.Tensor | None,
-        cu_seqlens: cute.Tensor | None,
-        tokens: Int32,
-    ):
-        """Advance one selected history slot without a compact staging tensor."""
-        thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, sequence, _ = cute.arch.block_idx()
-        channel_group = channel_block * self.threads + thread_idx
-        channel = channel_group * self.channels_per_thread
-
-        if channel < self.channels:
-            slot = state_indices[sequence]
-            if slot > 0:
-                if cutlass.const_expr(cu_seqlens is None):
-                    batch = Int32(sequence)
-                    sequence_start = Int32(0)
-                    sequence_end = tokens
-                else:
-                    batch = Int32(0)
-                    sequence_start = Int32(cu_seqlens[sequence])
-                    sequence_end = Int32(cu_seqlens[sequence + 1])
-                sequence_length = sequence_end - sequence_start
-                state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
-
-                for row in cutlass.range_constexpr(self.width - 1):
-                    values = cute.make_rmem_tensor(
-                        (self.channels_per_thread,), self.dtype.cute_type
-                    )
-                    values.fill(self.dtype.cute_type(0.0))
-                    input_time = sequence_end - (self.width - 1) + row
-                    if input_time >= sequence_start:
-                        values.store(self.input_group(x, batch, input_time, channel_group).load())
-                    # For short sequences the source row is ``row + sequence_length``,
-                    # so ascending stores cannot overwrite a value before it is read.
-                    elif cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
-                        values.store(
-                            state_groups[
-                                ((0, 0, None), (slot, row + sequence_length, channel_group))
-                            ].load()
-                        )
-                    elif has_initial_state[sequence]:
-                        values.store(
-                            state_groups[
-                                ((0, 0, None), (slot, row + sequence_length, channel_group))
-                            ].load()
-                        )
-                    state_groups[((0, 0, None), (slot, row, channel_group))].store(values.load())
-
-    @cute.jit
-    def __call__(
-        self,
-        x: cute.Tensor,
-        state: cute.Tensor,
-        state_indices: cute.Tensor,
-        has_initial_state: cute.Tensor | None,
-        cu_seqlens: cute.Tensor | None,
-        tokens: Int32,
-        stream,
-    ):
-        """Launch one state-update task per sequence and channel group."""
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens, tokens).launch(
-            grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.size(state_indices),
                 1,
             ),
             block=(self.threads, 1, 1),
@@ -3442,36 +3572,6 @@ def _compile_paged_forward(
 
 
 @jit_cache
-def _compile_paged_state_update(
-    channels: int,
-    width: int,
-    dtype: ShortConvDType,
-    config: ShortConvConfig,
-    input_alignment: int,
-    packed: bool,
-    use_has_initial_state: bool,
-    use_int64_offsets: bool = False,
-):
-    """Compile paged state updates with runtime token and sequence counts and input strides."""
-    operation = CausalConv1dPagedStateUpdate(
-        channels,
-        width,
-        config,
-        dtype,
-        use_int64_offsets,
-    )
-    return compile_tvm_ffi(
-        operation,
-        _fake_input(dtype, channels, input_alignment, use_int64_offsets),
-        _fake_decode_state(dtype, width, channels),
-        _fake_indices(True),
-        _fake_has_initial_state(use_has_initial_state),
-        _fake_indices(packed),
-        Int32(0),
-    )
-
-
-@jit_cache
 def _compile_decode(
     channels: int,
     width: int,
@@ -3554,7 +3654,6 @@ def _launch_paged_forward(
     dtype = SHORT_CONV_DTYPES[x.dtype]
     output = x.new_empty(x.shape)
     use_int64_offsets = _needs_int64(x, output)
-    # Both kernels share channel ownership, so they read x through one signature.
     input_alignment = _input_alignment(x, config)
     _compile_paged_forward(
         channels,
@@ -3574,23 +3673,6 @@ def _launch_paged_forward(
         state,
         state_indices,
         has_initial_state,
-        tokens,
-    )
-    _compile_paged_state_update(
-        channels,
-        width,
-        dtype,
-        ShortConvConfig(config.threads, config.channels_per_thread, 1),
-        input_alignment,
-        packed,
-        has_initial_state is not None,
-        use_int64_offsets,
-    )(
-        x,
-        state,
-        state_indices,
-        has_initial_state,
-        cu_seqlens,
         tokens,
     )
     return output
