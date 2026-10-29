@@ -235,8 +235,9 @@ def test_decode_capped_grid_matches_one_item_per_program(monkeypatch, gate: str)
 
     The kernel is shared by GDN (scalar gate) and KDA (vector gate).
     """
-    batch, heads, dim = 64, 4, 128
+    batch, dim = 64, 128
     inputs = make_decode_inputs(batch=batch, key_dim=dim, value_dim=dim, num_slots=batch + 1)
+    heads = inputs["state_cache"].shape[1]
     decode = recurrent_gdn_decode
     if gate == "vector":
         decode = recurrent_kda_decode
@@ -261,7 +262,9 @@ def test_decode_capped_grid_matches_one_item_per_program(monkeypatch, gate: str)
     # programs that loop (4 items each on GPUs with at most 512 SMs).
     for programs_per_sm in (decode_module._MAX_PROGRAMS_PER_SM, 1):
         monkeypatch.setattr(decode_module, "_MAX_PROGRAMS_PER_SM", programs_per_sm)
-        state = inputs["state_cache"].clone()
+        # Each launch gets its own slot-strided, misaligned pool, as serving engines pass.
+        _storage, state = strided_state_pool(batch + 1, heads, dim, dim)
+        state.copy_(inputs["state_cache"])
         output = decode(
             inputs["packed_qkv"],
             inputs["raw_gate"],
