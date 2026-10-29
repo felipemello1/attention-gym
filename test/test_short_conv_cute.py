@@ -4,7 +4,7 @@ import functools
 import math
 import sys
 from inspect import signature
-from itertools import pairwise
+from itertools import accumulate, pairwise
 from types import FunctionType
 
 import pytest
@@ -2315,7 +2315,7 @@ def test_paged_short_conv_prefill_matches_gather_scatter(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("activation", [None, "silu"])
 def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activation: str | None):
-    """Match decode numerically, not bitwise, while advancing exactly the same slots."""
+    """Match decode bitwise while advancing exactly the same slots."""
     torch.manual_seed(111)
     channels, width = 12, 4
     x = torch.randn(5, channels, device="cuda", dtype=dtype)
@@ -2324,7 +2324,7 @@ def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activatio
     fresh_mask = torch.tensor((False, True, False, False, True), device="cuda")
     offsets = torch.arange(x.shape[0] + 1, device="cuda", dtype=torch.int32)
     convolve = _reference if activation == "silu" else _plain_conv_reference
-    # Both paths accumulate in FP32 but may use different reduction/FMA ordering.
+    # The kernels and the eager reference accumulate in FP32 in different orders.
     # SiLU additionally uses the existing approximate-tanh epilogue tolerance.
     relative_budget = width * torch.finfo(torch.float32).eps + torch.finfo(dtype).eps
     if activation == "silu":
@@ -2367,9 +2367,7 @@ def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activatio
                     cu_seqlens=offsets if packed else None,
                     has_initial_state=mask,
                 ).reshape_as(x)
-                torch.testing.assert_close(
-                    actual, decoded, rtol=2 * relative_budget, atol=2 * relative_budget
-                )
+                torch.testing.assert_close(actual, decoded, rtol=0, atol=0)
                 assert torch.isfinite(actual).all()
                 assert torch.all((actual.double() - fp64).abs() <= eager_error + allowance)
                 torch.testing.assert_close(
@@ -2378,6 +2376,60 @@ def test_paged_short_conv_one_token_matches_decode(dtype: torch.dtype, activatio
                 torch.testing.assert_close(
                     paged_state, expected_state, rtol=0, atol=0, equal_nan=True
                 )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_paged_short_conv_mixed_step_matches_gather_scatter(dtype: torch.dtype):
+    """Convolve one-token and prefill sequences together, padded like a captured step.
+
+    Tile 1 holds 16 one-token sequences and 40 empty ones, so it crosses more than 31
+    boundaries; a null route sits among the live ones and null padding fills the capacity.
+    """
+    torch.manual_seed(113)
+    channels, width = 12, 4
+    lengths = [1] * 20 + [0] * 40 + [1] * 12 + [37, 0, 5, 2] + [1] * 9
+    capacity = len(lengths) + 30
+    offsets = torch.tensor(
+        [0, *accumulate(lengths)] + [sum(lengths)] * (capacity - len(lengths)),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    state_indices = torch.arange(1, capacity + 1, device="cuda", dtype=torch.int32)
+    state_indices[len(lengths) :] = 0
+    state_indices[5] = 0
+    has_initial_state = torch.rand(capacity, device="cuda") < 0.7
+    x = torch.randn(1, sum(lengths) + 7, channels, device="cuda", dtype=dtype)
+    weight = torch.randn(channels, width, device="cuda", dtype=dtype)
+    state = torch.randn(capacity + 1, width - 1, channels, device="cuda", dtype=dtype)
+    expected_output, expected_state = _paged_prefill_reference(
+        x, weight, state, state_indices, has_initial_state, offsets
+    )
+
+    with torch.no_grad():
+        decode_state = state.clone()
+        decoded = causal_conv1d_decode(
+            x[0, :20],
+            weight,
+            decode_state,
+            activation="silu",
+            state_indices=state_indices[:20],
+            has_initial_state=has_initial_state[:20],
+        )
+        actual = paged_causal_conv1d(
+            x,
+            weight,
+            state,
+            state_indices,
+            activation="silu",
+            cu_seqlens=offsets,
+            has_initial_state=has_initial_state,
+        )
+
+    active = sum(lengths)
+    torch.testing.assert_close(actual[:, :active], expected_output[:, :active], rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual[0, :20], decoded, rtol=0, atol=0)
+    torch.testing.assert_close(state[1:21], decode_state[1:21], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -2447,8 +2499,8 @@ def test_paged_short_conv_prefill_reads_strided_input_in_place(
 ):
     """Prefill channel-contiguous views in place, bitwise equal to their contiguous copy.
 
-    Both the forward and state-update kernels receive the view's storage and batch/token
-    strides; odd row pitches and misaligned storage take the general signature.
+    The kernel receives the view's storage and batch/token strides; odd row pitches and
+    misaligned storage take the general signature.
     """
     torch.manual_seed(108)
     channels, width = 12, 4
@@ -2477,11 +2529,7 @@ def test_paged_short_conv_prefill_reads_strided_input_in_place(
     actual_state = initial_state.clone()
     with torch.no_grad():
         expected = run(x.clone(memory_format=torch.contiguous_format), expected_state)
-        launches = _record_input_launches(
-            monkeypatch,
-            cute_backend._compile_paged_forward,
-            cute_backend._compile_paged_state_update,
-        )
+        launches = _record_input_launches(monkeypatch, cute_backend._compile_paged_forward)
         actual = run(x, actual_state)
 
     assert actual.is_contiguous()
@@ -2715,12 +2763,8 @@ def test_paged_short_conv_prefill_reuses_jit_cache(packed: bool, with_mask: bool
     torch.manual_seed(112)
     channels, width = 12, 4
     weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
-    compile_functions = (
-        cute_backend._compile_paged_forward,
-        cute_backend._compile_paged_state_update,
-    )
-    for compile_fn in compile_functions:
-        compile_fn.cache_clear()
+    compile_fn = cute_backend._compile_paged_forward
+    compile_fn.cache_clear()
 
     if packed:
         cases = (
@@ -2773,8 +2817,7 @@ def test_paged_short_conv_prefill_reuses_jit_cache(packed: bool, with_mask: bool
                 actual[:, :active_tokens], expected_output[:, :active_tokens], rtol=0, atol=0
             )
             torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
-            for compile_fn in compile_functions:
-                _assert_specializations(compile_fn, calls=call + 1, specializations=1)
+            _assert_specializations(compile_fn, calls=call + 1, specializations=1)
 
 
 def test_paged_short_conv_prefill_cuda_graph_replays_routing():
