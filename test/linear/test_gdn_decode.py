@@ -6,7 +6,8 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode
+from attn_gym.linear import recurrent_gdn, recurrent_gdn_decode, recurrent_kda_decode
+from attn_gym.linear._delta_rule import decode as decode_module
 from attn_gym.linear._delta_rule.decode import _decode_launch_config
 from attn_gym.linear._delta_rule.recurrent import GateKind
 from attn_gym.linear.gdn.ops import recurrent_decode_op
@@ -226,6 +227,59 @@ def test_decode_padding_and_fresh_slots():
     torch.testing.assert_close(
         inputs["state_cache"][preserved], original_pool[preserved], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("gate", ["scalar", "vector"])
+def test_decode_capped_grid_matches_one_item_per_program(monkeypatch, gate: str):
+    """A capped grid loops over the items, null rows mixed in, and matches the flat grid bitwise.
+
+    The kernel is shared by GDN (scalar gate) and KDA (vector gate).
+    """
+    batch, dim = 64, 128
+    inputs = make_decode_inputs(batch=batch, key_dim=dim, value_dim=dim, num_slots=batch + 1)
+    heads = inputs["state_cache"].shape[1]
+    decode = recurrent_gdn_decode
+    if gate == "vector":
+        decode = recurrent_kda_decode
+        inputs["raw_gate"] = torch.randn(1, batch, heads, dim, device="cuda")
+        inputs["dt_bias"] = 0.1 * torch.randn(heads, dim, device="cuda")
+    slots = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    slots[::3] = 0
+    kernel = decode_module._recurrent_delta_rule_decode_kernel
+    loops = []
+
+    class LaunchSpy:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                loops.append(kwargs["LOOP"])
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(decode_module, "_recurrent_delta_rule_decode_kernel", LaunchSpy())
+    results = []
+    # 64 rows x 4 heads x 8 V tiles = 2048 items: one program each, then max(SMs, 512)
+    # programs that loop (4 items each on GPUs with at most 512 SMs).
+    for programs_per_sm in (decode_module._MAX_PROGRAMS_PER_SM, 1):
+        monkeypatch.setattr(decode_module, "_MAX_PROGRAMS_PER_SM", programs_per_sm)
+        # Each launch gets its own slot-strided, misaligned pool, as serving engines pass.
+        _storage, state = strided_state_pool(batch + 1, heads, dim, dim)
+        state.copy_(inputs["state_cache"])
+        output = decode(
+            inputs["packed_qkv"],
+            inputs["raw_gate"],
+            inputs["raw_beta"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            state,
+            slots,
+        )
+        results.append((output, state))
+
+    assert loops == [False, True]
+    (flat_output, flat_state), (looped_output, looped_state) = results
+    assert looped_output[0, ::3].eq(0).all()
+    assert torch.equal(looped_output, flat_output) and torch.equal(looped_state, flat_state)
 
 
 def test_decode_out_buffer_contract():

@@ -73,11 +73,21 @@ def _decode_launch_config(
     return min(triton.next_power_of_2(value_dim), block_v), num_warps
 
 
-# Use a flat 1D grid of B * H * ceil(V / BV) programs. Each program owns one
-# (batch row, value head, V tile), processes all K channels for that tile, and gets
-# contiguous K-dimension accesses from the [V, K] state layout.
+# Work items are (batch row, value head, V tile), B * H * ceil(V / BV) of them. Each item
+# processes all K channels for its tile, and gets contiguous K-dimension accesses from the
+# [V, K] state layout. Below SMs * _MAX_PROGRAMS_PER_SM items, each program runs one item.
+# Above it the grid is capped and programs loop over the items: a caller that runs a
+# fixed-size batch with few active rows (e.g. inside a whole-step CUDA graph) passes null
+# rows, and a null item then costs a slot load and a zero store, not a launched program.
+# Each program takes at most _MAX_ITEMS_PER_PROGRAM items: items are assigned at launch,
+# so more items per program means a longer tail on large active batches.
+_MAX_PROGRAMS_PER_SM = 256
+_MAX_ITEMS_PER_PROGRAM = 4
+
+
 @triton.jit
-def _recurrent_delta_rule_decode_kernel(
+def _decode_item(
+    pid,
     packed_qkv,
     raw_gate,
     raw_beta,
@@ -103,7 +113,6 @@ def _recurrent_delta_rule_decode_kernel(
     SCALAR_GATE: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
     NV = tl.cdiv(V, BV)
     i_v = pid % NV
     i_nh = pid // NV
@@ -183,6 +192,94 @@ def _recurrent_delta_rule_decode_kernel(
     tl.store(state_cache + p_state, b_state, mask=m_vk)
 
 
+@triton.jit(do_not_specialize=["num_items"])
+def _recurrent_delta_rule_decode_kernel(
+    packed_qkv,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    output,
+    state_cache,
+    state_indices,
+    has_initial_state,
+    lower_bound,
+    scale,
+    num_items,
+    state_batch_stride: tl.constexpr,
+    qkv_token_stride: tl.constexpr,
+    gate_token_stride: tl.constexpr,
+    beta_token_stride: tl.constexpr,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
+    USE_HAS_INITIAL_STATE: tl.constexpr,
+    LOOP: tl.constexpr,
+):
+    if LOOP:
+        for item in tl.range(tl.program_id(0), num_items, tl.num_programs(0)):
+            _decode_item(
+                item.to(tl.int64),
+                packed_qkv,
+                raw_gate,
+                raw_beta,
+                A_log,
+                dt_bias,
+                output,
+                state_cache,
+                state_indices,
+                has_initial_state,
+                lower_bound,
+                scale,
+                state_batch_stride,
+                qkv_token_stride,
+                gate_token_stride,
+                beta_token_stride,
+                H,
+                HK,
+                K,
+                V,
+                BK,
+                BV,
+                USE_LOWER_BOUND,
+                SCALAR_GATE,
+                USE_HAS_INITIAL_STATE,
+            )
+    else:
+        _decode_item(
+            tl.program_id(0).to(tl.int64),
+            packed_qkv,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            output,
+            state_cache,
+            state_indices,
+            has_initial_state,
+            lower_bound,
+            scale,
+            state_batch_stride,
+            qkv_token_stride,
+            gate_token_stride,
+            beta_token_stride,
+            H,
+            HK,
+            K,
+            V,
+            BK,
+            BV,
+            USE_LOWER_BOUND,
+            SCALAR_GATE,
+            USE_HAS_INITIAL_STATE,
+        )
+
+
 def launch_recurrent_delta_rule_decode(
     packed_qkv: torch.Tensor,
     raw_gate: torch.Tensor,
@@ -238,7 +335,8 @@ def launch_recurrent_delta_rule_decode(
     batch = packed_qkv.shape[0]
     heads, value_dim, key_dim = state_cache.shape[1:]
     assert key_heads > 0 and heads % key_heads == 0
-    major = get_device_properties(packed_qkv.device).major
+    properties = get_device_properties(packed_qkv.device)
+    major = properties.major
     measured_gdn_shape = packed_qkv.dtype is torch.bfloat16 and key_dim == value_dim == 128
     tuned_major = None
     if measured_gdn_shape and (
@@ -257,7 +355,12 @@ def launch_recurrent_delta_rule_decode(
         tuned_major,
         gate_kind,
     )
-    grid = (triton.cdiv(value_dim, block_v) * batch * heads,)
+    num_items = triton.cdiv(value_dim, block_v) * batch * heads
+    max_programs = max(
+        properties.multi_processor_count * _MAX_PROGRAMS_PER_SM,
+        triton.cdiv(num_items, _MAX_ITEMS_PER_PROGRAM),
+    )
+    grid = (min(num_items, max_programs),)
     _recurrent_delta_rule_decode_kernel[grid](
         packed_qkv,
         raw_gate,
@@ -270,6 +373,7 @@ def launch_recurrent_delta_rule_decode(
         has_initial_state,
         lower_bound,
         scale=scale,
+        num_items=num_items,
         state_batch_stride=state_cache.stride(0),
         qkv_token_stride=packed_qkv.stride(0),
         gate_token_stride=raw_gate.stride(0),
@@ -283,6 +387,7 @@ def launch_recurrent_delta_rule_decode(
         USE_LOWER_BOUND=gate_transform is GateTransform.BOUNDED,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
         USE_HAS_INITIAL_STATE=has_initial_state is not None,
+        LOOP=grid[0] < num_items,
         num_warps=num_warps,
     )
 
